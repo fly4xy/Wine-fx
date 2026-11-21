@@ -105,6 +105,16 @@ before related fixes were merged (the descriptions inside still use those number
 | 0016 chromium-composition-and-cursor | dcomp, dxgi, win32u, server, winex11, winewayland | programs on WebView2/Chromium (the new Epic Games Launcher) show their window instead of white or a solid fill, under X11 and Wayland, with Wine's own d3d11/dxgi (not DXVK); the cursor shows over their content | 0029, 0030, 0031, 0038 |
 | 0017 ntdll-written-copy-on-write-pages-are-read-write | ntdll | VirtualProtect gives the old protection of copy-on-write pages as read-write: Chromium in Battle.net (libcef) no longer stops itself | 0039 |
 
+## Patches (Wine 11.7)
+
+Wine 11.7 is the version Epic Games' own build is based on. `versions/11.7/epic/`: Epic Games'
+patches (with the crypt32 one). `versions/11.7/patches/`:
+
+| Patch | Modules | What it fixes |
+|---|---|---|
+| 0001 winex11-window-region-and-pointer-window | winex11 | as 11.22's 0001 under X11, with the X11 size hints of captionless popups left out (KWin clamped their resize) |
+| 0002 server-ntdll-readonly-file-attributes | server, ntdll | read-only files: their times can be read and set, as on Windows (Perforce) |
+
 Not here: Wine-Fx's fixes to Windows modules that can go into one prefix (native file dialogs,
 dragging files in, `.bat` scripts, the Epic Games Launcher's start). [Wine Fox](https://lis-carter.site/wine-fox/)
 carries them and installs them into prefixes (Tools, Patches). The new Epic Games Launcher

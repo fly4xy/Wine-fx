@@ -105,6 +105,16 @@ bash build.sh
 | 0016 chromium-composition-and-cursor | dcomp, dxgi, win32u, server, winex11, winewayland | программы на WebView2/Chromium (новый Epic Games Launcher) показывают окно вместо белой или сплошной заливки, под X11 и Wayland, со встроенными d3d11/dxgi Wine (не DXVK); курсор виден над их содержимым | 0029, 0030, 0031, 0038 |
 | 0017 ntdll-written-copy-on-write-pages-are-read-write | ntdll | VirtualProtect отдаёт прежнюю защиту страниц copy-on-write как read-write: Chromium в Battle.net (libcef) больше не останавливает сам себя | 0039 |
 
+## Патчи (Wine 11.7)
+
+На Wine 11.7 основана собственная сборка Epic Games. `versions/11.7/epic/`: патчи Epic Games
+(вместе с патчем для crypt32). `versions/11.7/patches/`:
+
+| Патч | Модули | Что исправляет |
+|---|---|---|
+| 0001 winex11-window-region-and-pointer-window | winex11 | как 0001 для 11.22 под X11, плюс без подсказок размера у попапов без заголовка (KWin ограничивал изменение их размера) |
+| 0002 server-ntdll-readonly-file-attributes | server, ntdll | файлы только для чтения: их время можно прочитать и изменить, как в Windows (Perforce) |
+
 Чего здесь нет: исправлений Wine-Fx в Windows-модулях, которые можно поставить в один префикс
 (системные диалоги файлов, перетаскивание файлов, `.bat`-скрипты, запуск Epic Games Launcher).
 Их несёт [Wine Fox](https://lis-carter.site/wine-fox/) и ставит в префиксы («Инструменты»,

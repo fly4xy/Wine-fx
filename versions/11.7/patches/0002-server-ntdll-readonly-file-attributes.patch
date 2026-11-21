@@ -1,0 +1,53 @@
+From: Wine Fox <wine-native-dialogs>
+Subject: [PATCH] server, ntdll: Attributes of read-only files, as on Windows.
+
+The owner of a read-only file may open it with FILE_WRITE_ATTRIBUTES on Windows (to read and
+set its times, or clear the read-only flag); only writing its data is denied. Wine opened such
+a file O_RDWR and failed with STATUS_ACCESS_DENIED, so programs that read times through such a
+handle got nothing: Perforce's p4.exe sends "time = -1" for files of a noallwrite workspace.
+
+server: when the open for writing fails with EACCES, no data is to be written (no
+FILE_WRITE_DATA / FILE_APPEND_DATA, no truncation) and the user owns the regular file, open it
+read-only. futimens and fchmod work on such a descriptor for the owner; NtWriteFile is still
+refused by the handle's access.
+
+ntdll: NtSetInformationFile(FileBasicInformation) with FileAttributes 0 means "leave them",
+as SetFileTime passes; Wine took it for "not read-only" and made the file writable, which the
+server change would have made reachable for read-only files.
+
+Test: tests/rotimetest.c.
+---
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1995,6 +1995,18 @@
+                 fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
+         }
+ 
++        /* Windows lets the owner of a read-only file open it for its attributes (times, the
++         * read-only flag): with no data to write, open the file read-only; times and mode
++         * are set through such a descriptor all the same (futimens, fchmod by the owner) */
++        if (fd->unix_fd == -1 && errno == EACCES && rw_mode != O_RDONLY &&
++            !(access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) && !(flags & O_TRUNC))
++        {
++            struct stat st_ro;
++            if (!stat( name, &st_ro ) && S_ISREG(st_ro.st_mode) && st_ro.st_uid == getuid())
++                fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
++            if (fd->unix_fd == -1) errno = EACCES;
++        }
++
+         if (fd->unix_fd == -1)
+         {
+             /* check for trailing slash on file path */
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5218,7 +5218,9 @@
+             if (atime.QuadPart || mtime.QuadPart)
+                 status = set_file_times( fd, &mtime, &atime );
+ 
+-            if (status == STATUS_SUCCESS)
++            /* zero attributes leave them as they are (SetFileTime passes zero): not a request
++             * to clear FILE_ATTRIBUTE_READONLY */
++            if (status == STATUS_SUCCESS && info->FileAttributes)
+                 status = fd_set_file_info( fd, info->FileAttributes,
+                                            unix_name && is_hidden_file( unix_name ));
+ 
