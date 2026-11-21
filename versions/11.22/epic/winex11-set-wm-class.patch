@@ -1,0 +1,13 @@
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -1174,8 +1174,9 @@
+     if ((class_hints = XAllocClassHint()))
+     {
++        char *wine_wm_class = getenv( "WINEWMCLASS" );
+         class_hints->res_name = process_name;
+-        class_hints->res_class = process_name;
++        class_hints->res_class = wine_wm_class ? wine_wm_class : process_name;
+         XSetClassHint( display, window, class_hints );
+         XFree( class_hints );
+     }
+ 

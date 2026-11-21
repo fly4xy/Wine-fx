@@ -1,0 +1,26 @@
+From: Wine Fox
+Subject: [PATCH] ntdll: Zero attributes in FileBasicInformation leave them as they are.
+
+SetFileTime() passes FileBasicInformation with FileAttributes 0, which on Windows means "do
+not change the attributes". Wine treated it as "clear FILE_ATTRIBUTE_READONLY" and made
+read-only files writable when their times were set (Perforce's noallwrite workspaces).
+
+Wine 11.22 lets the owner open a read-only file for FILE_WRITE_ATTRIBUTES on its own (server:
+"Don't require Unix write access to change file attributes", Wine-Bug 56925), so the server
+half of the 11.7 patch is gone.
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index d99a9a1..b64329f 100755
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -4912,7 +4912,9 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             if (atime.QuadPart || mtime.QuadPart)
+                 status = set_file_times( fd, &mtime, &atime );
+ 
+-            if (status == STATUS_SUCCESS)
++            /* zero attributes leave them as they are (SetFileTime passes zero): not a request
++             * to clear FILE_ATTRIBUTE_READONLY */
++            if (status == STATUS_SUCCESS && info->FileAttributes)
+                 status = fd_set_file_info( fd, info->FileAttributes,
+                                            unix_name && is_hidden_file( unix_name ));
+ 

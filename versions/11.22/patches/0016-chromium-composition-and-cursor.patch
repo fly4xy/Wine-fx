@@ -1,0 +1,1245 @@
+From: Wine Fox
+Subject: [PATCH] dcomp, dxgi, win32u, server, winex11, winewayland: Chromium's composition swapchains and cursor (WebView2, the new Epic Games Launcher).
+
+* dcomp, dxgi: Composition swapchains shown in a window, for Chromium's software output.
+
+Programs on Microsoft Edge WebView2 157 (the new Epic Games Launcher, Tauri and others) showed a
+white window: WebView2's GPU process died every few seconds on a CHECK and the browser gave up.
+Chromium's software compositor (the path it takes with no usable GPU, and the one it falls back
+to) draws through SoftwareOutputDeviceWinSwapChain: a WARP D3D11 device, DCompositionCreateDevice,
+a target for its own child window, one visual whose content is a swapchain from
+CreateSwapChainForComposition, then per frame a copy of the damaged part into buffer 0 and
+Present1. Any failure but E_ACCESSDENIED there is a CHECK, and Wine's DCompositionCreateDevice
+and CreateSwapChainForComposition returned E_NOTIMPL.
+
+- dcomp: DCompositionCreateDevice returns a minimal IDCompositionDevice: CreateTargetForHwnd,
+  CreateVisual, SetRoot, SetContent and Commit work; a target shows the swapchain that is the
+  content of its root visual. Child visuals, offsets, transforms and clips are accepted and
+  ignored, surfaces, transforms, effects and animations are E_NOTIMPL.
+- dxgi: CreateSwapChainForComposition makes a windowed swapchain on the factory's hidden device
+  window; dcomp's Commit tells it (a private GUID with SetPrivateData) which window it is shown
+  in. Present of such a swapchain copies buffer 0 to that window with GDI: Chromium's window is a
+  child of the browser's, in another process, which GL presentation does not reach, while GDI
+  does under X11. Buffer 0 is never rotated, so Chromium's damage-only updates keep a full image.
+
+Under Wayland a window of another process' top level still shows nothing (winewayland draws
+only in the windows of its own process): run such programs with X11.
+
+* win32u, dxgi: Composition frames drawn by the process of the top level, for Wayland.
+
+With 0029 programs on WebView2 157 (the new Epic Games Launcher) showed their window under X11
+only: under winewayland it stayed white. Chromium's GPU process draws in its own "Intermediate
+D3D Window", a child of the browser's window, itself a child of the program's top level, and
+winewayland draws only in the windows of the process that owns the top level: a DC of that
+window in the GPU process has no surface, and GL presentation does not reach it either.
+
+- win32u: a new internal message, WM_WINE_COMPOSITION_PRESENT, sent to the top level: wparam is
+  a window under it, lparam a section handle in the receiving process with the frame (a small
+  header and 32-bit rows). The process of the top level draws it in that window with GDI, into
+  its own window surface, and closes the handle. The frame and the window are checked first.
+- dxgi: Present of a composition swapchain whose window's top level belongs to another process
+  and is not an X11 window copies buffer 0 into a section, duplicates its handle into that
+  process and sends it the message (100 ms timeout). Under X11 GDI still draws from the GPU
+  process directly, as with 0029.
+
+* dxgi: Swapchains in a window of another process' top level presented as composition ones.
+
+With 0029 and 0030 the new Epic Games Launcher (WebView2 157) showed its UI where Chromium
+composites in software (no usable GPU), but on a real GPU (AMD, Mesa) its window stayed a solid
+fill under X11 and Wayland. With GPU compositing Chromium's GPU process presents a regular
+windowed D3D11 swapchain (ANGLE) in its window, a child of the browser's window, whose top level
+is the program's, in other processes. GL presentation does not show there: winewayland draws
+only in the top levels of its own process, and under X11 the top level's process paints over it.
+
+Present of a windowed D3D11 swapchain whose window's top level belongs to another process now
+goes the way of a composition swapchain (0029, 0030): buffer 0 is read back and drawn with GDI,
+from here under X11 and by the top level's process under Wayland. Buffer 0 is not rotated, as for
+composition swapchains. R8G8B8A8 back buffers are accepted too (swapped to BGRA for GDI).
+Shown with a test of two processes (a hardware D3D11 swapchain in a child of the other process'
+window), under winex11 and winewayland.
+
+* server, winex11, winewayland: The cursor over a child of another process' top level.
+
+The new Epic Games Launcher (WebView2) showed no cursor over its window under Wayland. Its content
+is a child window of Chromium's browser process in the launcher's top level. That process gets
+the mouse messages there and sets the cursor, but the server took the top level as the cursor
+window, so the cursor the browser process set went nowhere, and WM_WINE_SETCURSOR brought the
+top level's process its own cursor, none.
+
+The server now takes the window under the pointer as the cursor window when it belongs to
+another process than its top level: its thread is the one that gets the mouse messages
+(window_thread_from_point). The driver of that process then sets the cursor for a window of a
+top level it does not own: winex11 on the top level's X window, which is the display's;
+winewayland, where only the top level's process has the pointer, posts the cursor's shape
+(cursor-shape-v1) to the top level, whose process sets it while the pointer is over it.
+Windows of one process are as before.
+Shown with a test of two processes under winex11 (WM_WINE_SETCURSOR reaches the child's process).
+
+diff --git a/dlls/dcomp/Makefile.in b/dlls/dcomp/Makefile.in
+index 3c14125..e63b43f 100755
+--- a/dlls/dcomp/Makefile.in
++++ b/dlls/dcomp/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = dcomp.dll
++IMPORTS   = dxguid uuid user32
+ 
+ VER_PRODUCTVERSION = 10,0,14393,0
+ 
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index 2744d75..6fdd1af 100755
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -17,19 +17,462 @@
+  */
+ #include <stdarg.h>
+ 
++#define COBJMACROS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winuser.h"
+ #include "objidl.h"
+-#include "dxgi.h"
++#include "dxgi1_6.h"
++#include "d2d1_1.h"
++#include "dcompanimation.h"
++#include "wine/wined3d.h"
++#include "initguid.h"
++#include "dcomp.h"
++#include "wine/winedxgi.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+ 
+-HRESULT WINAPI DCompositionCreateDevice(IDXGIDevice *dxgi_device, REFIID iid, void **device)
++/* A minimal IDCompositionDevice: a target window shows the swapchain that is the content of
++ * its root visual (what Chromium's software output device builds). Child visuals, offsets,
++ * transforms, clips and surfaces are not composed. */
++
++struct composition_visual
+ {
+-    FIXME("%p, %s, %p.\n", dxgi_device, debugstr_guid(iid), device);
++    IDCompositionVisual IDCompositionVisual_iface;
++    LONG refcount;
++    IUnknown *content;
++};
+ 
+-    return E_NOTIMPL;
++struct composition_device
++{
++    IDCompositionDevice IDCompositionDevice_iface;
++    LONG refcount;
++    struct list targets;
++};
++
++struct composition_target
++{
++    IDCompositionTarget IDCompositionTarget_iface;
++    LONG refcount;
++    struct composition_device *device;
++    struct list entry;
++    HWND hwnd;
++    struct composition_visual *root;
++    IDXGISwapChain *shown;
++};
++
++static const IDCompositionVisualVtbl visual_vtbl;
++
++static struct composition_visual *impl_from_IDCompositionVisual(IDCompositionVisual *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisual_iface);
++}
++
++static struct composition_visual *unsafe_impl_from_IDCompositionVisual(IDCompositionVisual *iface)
++{
++    if (!iface || iface->lpVtbl != &visual_vtbl)
++        return NULL;
++    return impl_from_IDCompositionVisual(iface);
++}
++
++static HRESULT STDMETHODCALLTYPE visual_QueryInterface(IDCompositionVisual *iface, REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IDCompositionVisual) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        IDCompositionVisual_AddRef(*out = iface);
++        return S_OK;
++    }
++
++    WARN("%s not implemented.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE visual_AddRef(IDCompositionVisual *iface)
++{
++    struct composition_visual *visual = impl_from_IDCompositionVisual(iface);
++    ULONG refcount = InterlockedIncrement(&visual->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", iface, refcount);
++    return refcount;
++}
++
++static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisual *iface)
++{
++    struct composition_visual *visual = impl_from_IDCompositionVisual(iface);
++    ULONG refcount = InterlockedDecrement(&visual->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
++    if (!refcount)
++    {
++        if (visual->content)
++            IUnknown_Release(visual->content);
++        free(visual);
++    }
++    return refcount;
++}
++
++#define VISUAL_IGNORED(name, args) \
++    static HRESULT STDMETHODCALLTYPE visual_##name args \
++    { \
++        FIXME("iface %p, ignored.\n", iface); \
++        return S_OK; \
++    }
++
++VISUAL_IGNORED(SetOffsetXAnimation, (IDCompositionVisual *iface, IDCompositionAnimation *animation))
++VISUAL_IGNORED(SetOffsetX, (IDCompositionVisual *iface, float offset_x))
++VISUAL_IGNORED(SetOffsetYAnimation, (IDCompositionVisual *iface, IDCompositionAnimation *animation))
++VISUAL_IGNORED(SetOffsetY, (IDCompositionVisual *iface, float offset_y))
++VISUAL_IGNORED(SetTransformObject, (IDCompositionVisual *iface, IDCompositionTransform *transform))
++VISUAL_IGNORED(SetTransform, (IDCompositionVisual *iface, const D2D_MATRIX_3X2_F *matrix))
++VISUAL_IGNORED(SetTransformParent, (IDCompositionVisual *iface, IDCompositionVisual *visual))
++VISUAL_IGNORED(SetEffect, (IDCompositionVisual *iface, IDCompositionEffect *effect))
++VISUAL_IGNORED(SetBitmapInterpolationMode, (IDCompositionVisual *iface, enum DCOMPOSITION_BITMAP_INTERPOLATION_MODE mode))
++VISUAL_IGNORED(SetBorderMode, (IDCompositionVisual *iface, enum DCOMPOSITION_BORDER_MODE mode))
++VISUAL_IGNORED(SetClipObject, (IDCompositionVisual *iface, IDCompositionClip *clip))
++VISUAL_IGNORED(SetClip, (IDCompositionVisual *iface, const D2D_RECT_F *rect))
++VISUAL_IGNORED(AddVisual, (IDCompositionVisual *iface, IDCompositionVisual *visual, BOOL insert_above, IDCompositionVisual *reference))
++VISUAL_IGNORED(RemoveVisual, (IDCompositionVisual *iface, IDCompositionVisual *visual))
++VISUAL_IGNORED(RemoveAllVisuals, (IDCompositionVisual *iface))
++VISUAL_IGNORED(SetCompositeMode, (IDCompositionVisual *iface, enum DCOMPOSITION_COMPOSITE_MODE mode))
++
++static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisual *iface, IUnknown *content)
++{
++    struct composition_visual *visual = impl_from_IDCompositionVisual(iface);
++
++    TRACE("iface %p, content %p.\n", iface, content);
++
++    if (content)
++        IUnknown_AddRef(content);
++    if (visual->content)
++        IUnknown_Release(visual->content);
++    visual->content = content;
++    return S_OK;
++}
++
++static const IDCompositionVisualVtbl visual_vtbl =
++{
++    visual_QueryInterface,
++    visual_AddRef,
++    visual_Release,
++    visual_SetOffsetXAnimation,
++    visual_SetOffsetX,
++    visual_SetOffsetYAnimation,
++    visual_SetOffsetY,
++    visual_SetTransformObject,
++    visual_SetTransform,
++    visual_SetTransformParent,
++    visual_SetEffect,
++    visual_SetBitmapInterpolationMode,
++    visual_SetBorderMode,
++    visual_SetClipObject,
++    visual_SetClip,
++    visual_SetContent,
++    visual_AddVisual,
++    visual_RemoveVisual,
++    visual_RemoveAllVisuals,
++    visual_SetCompositeMode,
++};
++
++/* Tell dxgi which window a composition swapchain presents to (NULL: none). */
++static void show_swapchain(IDXGISwapChain *swapchain, HWND hwnd)
++{
++    HRESULT hr;
++
++    if (FAILED(hr = IDXGISwapChain_SetPrivateData(swapchain, &WINE_DXGI_COMPOSITION_WINDOW, sizeof(hwnd), &hwnd)))
++        WARN("Failed to set the window of swapchain %p, hr %#lx.\n", swapchain, hr);
++}
++
++static void target_update(struct composition_target *target)
++{
++    IDXGISwapChain *swapchain = NULL;
++
++    if (target->root && target->root->content)
++        IUnknown_QueryInterface(target->root->content, &IID_IDXGISwapChain, (void **)&swapchain);
++    if (swapchain == target->shown)
++    {
++        if (swapchain)
++            IDXGISwapChain_Release(swapchain);
++        return;
++    }
++    if (target->shown)
++    {
++        show_swapchain(target->shown, NULL);
++        IDXGISwapChain_Release(target->shown);
++    }
++    if ((target->shown = swapchain))
++        show_swapchain(swapchain, target->hwnd);
++    TRACE("Target %p (window %p) shows swapchain %p.\n", target, target->hwnd, swapchain);
++}
++
++static struct composition_target *impl_from_IDCompositionTarget(IDCompositionTarget *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_target, IDCompositionTarget_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE target_QueryInterface(IDCompositionTarget *iface, REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IDCompositionTarget) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        IDCompositionTarget_AddRef(*out = iface);
++        return S_OK;
++    }
++
++    WARN("%s not implemented.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE target_AddRef(IDCompositionTarget *iface)
++{
++    struct composition_target *target = impl_from_IDCompositionTarget(iface);
++    ULONG refcount = InterlockedIncrement(&target->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", iface, refcount);
++    return refcount;
++}
++
++static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
++{
++    struct composition_target *target = impl_from_IDCompositionTarget(iface);
++    ULONG refcount = InterlockedDecrement(&target->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
++    if (!refcount)
++    {
++        if (target->shown)
++        {
++            show_swapchain(target->shown, NULL);
++            IDXGISwapChain_Release(target->shown);
++        }
++        if (target->root)
++            IDCompositionVisual_Release(&target->root->IDCompositionVisual_iface);
++        list_remove(&target->entry);
++        IDCompositionDevice_Release(&target->device->IDCompositionDevice_iface);
++        free(target);
++    }
++    return refcount;
++}
++
++static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface, IDCompositionVisual *visual)
++{
++    struct composition_target *target = impl_from_IDCompositionTarget(iface);
++    struct composition_visual *root = unsafe_impl_from_IDCompositionVisual(visual);
++
++    TRACE("iface %p, visual %p.\n", iface, visual);
++
++    if (visual && !root)
++        return E_INVALIDARG;
++    if (root)
++        IDCompositionVisual_AddRef(visual);
++    if (target->root)
++        IDCompositionVisual_Release(&target->root->IDCompositionVisual_iface);
++    target->root = root;
++    return S_OK;
++}
++
++static const IDCompositionTargetVtbl target_vtbl =
++{
++    target_QueryInterface,
++    target_AddRef,
++    target_Release,
++    target_SetRoot,
++};
++
++static struct composition_device *impl_from_IDCompositionDevice(IDCompositionDevice *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *iface, REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IDCompositionDevice) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        IDCompositionDevice_AddRef(*out = iface);
++        return S_OK;
++    }
++
++    WARN("%s not implemented.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE device_AddRef(IDCompositionDevice *iface)
++{
++    struct composition_device *device = impl_from_IDCompositionDevice(iface);
++    ULONG refcount = InterlockedIncrement(&device->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", iface, refcount);
++    return refcount;
++}
++
++static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
++{
++    struct composition_device *device = impl_from_IDCompositionDevice(iface);
++    ULONG refcount = InterlockedDecrement(&device->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
++    if (!refcount)
++        free(device);
++    return refcount;
++}
++
++static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
++{
++    struct composition_device *device = impl_from_IDCompositionDevice(iface);
++    struct composition_target *target;
++
++    TRACE("iface %p.\n", iface);
++
++    /* shortcut: no lock, callers commit from the thread that builds the tree (Chromium does);
++     * add a critical section if a multithreaded user shows up. */
++    LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
++        target_update(target);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE device_WaitForCommitCompletion(IDCompositionDevice *iface)
++{
++    TRACE("iface %p.\n", iface);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE device_CreateTargetForHwnd(IDCompositionDevice *iface,
++        HWND hwnd, BOOL topmost, IDCompositionTarget **out)
++{
++    struct composition_device *device = impl_from_IDCompositionDevice(iface);
++    struct composition_target *target;
++
++    TRACE("iface %p, hwnd %p, topmost %d, out %p.\n", iface, hwnd, topmost, out);
++
++    if (!out)
++        return E_INVALIDARG;
++    *out = NULL;
++    if (!IsWindow(hwnd))
++        return E_INVALIDARG;
++    if (!(target = calloc(1, sizeof(*target))))
++        return E_OUTOFMEMORY;
++    target->IDCompositionTarget_iface.lpVtbl = &target_vtbl;
++    target->refcount = 1;
++    target->hwnd = hwnd;
++    target->device = device;
++    IDCompositionDevice_AddRef(iface);
++    list_add_tail(&device->targets, &target->entry);
++    *out = &target->IDCompositionTarget_iface;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE device_CreateVisual(IDCompositionDevice *iface, IDCompositionVisual **out)
++{
++    struct composition_visual *visual;
++
++    TRACE("iface %p, out %p.\n", iface, out);
++
++    if (!out)
++        return E_INVALIDARG;
++    if (!(visual = calloc(1, sizeof(*visual))))
++        return E_OUTOFMEMORY;
++    visual->IDCompositionVisual_iface.lpVtbl = &visual_vtbl;
++    visual->refcount = 1;
++    *out = &visual->IDCompositionVisual_iface;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE device_CheckDeviceState(IDCompositionDevice *iface, BOOL *valid)
++{
++    TRACE("iface %p, valid %p.\n", iface, valid);
++
++    if (!valid)
++        return E_INVALIDARG;
++    *valid = TRUE;
++    return S_OK;
++}
++
++#define DEVICE_NOTIMPL(name, args) \
++    static HRESULT STDMETHODCALLTYPE device_##name args \
++    { \
++        FIXME("iface %p, stub!\n", iface); \
++        return E_NOTIMPL; \
++    }
++
++DEVICE_NOTIMPL(GetFrameStatistics, (IDCompositionDevice *iface, DCOMPOSITION_FRAME_STATISTICS *statistics))
++DEVICE_NOTIMPL(CreateSurface, (IDCompositionDevice *iface, UINT width, UINT height, DXGI_FORMAT format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **surface))
++DEVICE_NOTIMPL(CreateVirtualSurface, (IDCompositionDevice *iface, UINT width, UINT height, DXGI_FORMAT format, DXGI_ALPHA_MODE alpha_mode, IDCompositionVirtualSurface **surface))
++DEVICE_NOTIMPL(CreateSurfaceFromHandle, (IDCompositionDevice *iface, HANDLE handle, IUnknown **surface))
++DEVICE_NOTIMPL(CreateSurfaceFromHwnd, (IDCompositionDevice *iface, HWND hwnd, IUnknown **surface))
++DEVICE_NOTIMPL(CreateTranslateTransform, (IDCompositionDevice *iface, IDCompositionTranslateTransform **transform))
++DEVICE_NOTIMPL(CreateScaleTransform, (IDCompositionDevice *iface, IDCompositionScaleTransform **transform))
++DEVICE_NOTIMPL(CreateRotateTransform, (IDCompositionDevice *iface, IDCompositionRotateTransform **transform))
++DEVICE_NOTIMPL(CreateSkewTransform, (IDCompositionDevice *iface, IDCompositionSkewTransform **transform))
++DEVICE_NOTIMPL(CreateMatrixTransform, (IDCompositionDevice *iface, IDCompositionMatrixTransform **transform))
++DEVICE_NOTIMPL(CreateTransformGroup, (IDCompositionDevice *iface, IDCompositionTransform **transforms, UINT elements, IDCompositionTransform **group))
++DEVICE_NOTIMPL(CreateTranslateTransform3D, (IDCompositionDevice *iface, IDCompositionTranslateTransform3D **transform))
++DEVICE_NOTIMPL(CreateScaleTransform3D, (IDCompositionDevice *iface, IDCompositionScaleTransform3D **transform))
++DEVICE_NOTIMPL(CreateRotateTransform3D, (IDCompositionDevice *iface, IDCompositionRotateTransform3D **transform))
++DEVICE_NOTIMPL(CreateMatrixTransform3D, (IDCompositionDevice *iface, IDCompositionMatrixTransform3D **transform))
++DEVICE_NOTIMPL(CreateTransform3DGroup, (IDCompositionDevice *iface, IDCompositionTransform3D **transforms, UINT elements, IDCompositionTransform3D **group))
++DEVICE_NOTIMPL(CreateEffectGroup, (IDCompositionDevice *iface, IDCompositionEffectGroup **group))
++DEVICE_NOTIMPL(CreateRectangleClip, (IDCompositionDevice *iface, IDCompositionRectangleClip **clip))
++DEVICE_NOTIMPL(CreateAnimation, (IDCompositionDevice *iface, IDCompositionAnimation **animation))
++
++static const IDCompositionDeviceVtbl device_vtbl =
++{
++    device_QueryInterface,
++    device_AddRef,
++    device_Release,
++    device_Commit,
++    device_WaitForCommitCompletion,
++    device_GetFrameStatistics,
++    device_CreateTargetForHwnd,
++    device_CreateVisual,
++    device_CreateSurface,
++    device_CreateVirtualSurface,
++    device_CreateSurfaceFromHandle,
++    device_CreateSurfaceFromHwnd,
++    device_CreateTranslateTransform,
++    device_CreateScaleTransform,
++    device_CreateRotateTransform,
++    device_CreateSkewTransform,
++    device_CreateMatrixTransform,
++    device_CreateTransformGroup,
++    device_CreateTranslateTransform3D,
++    device_CreateScaleTransform3D,
++    device_CreateRotateTransform3D,
++    device_CreateMatrixTransform3D,
++    device_CreateTransform3DGroup,
++    device_CreateEffectGroup,
++    device_CreateRectangleClip,
++    device_CreateAnimation,
++    device_CheckDeviceState,
++};
++
++HRESULT WINAPI DCompositionCreateDevice(IDXGIDevice *dxgi_device, REFIID iid, void **out)
++{
++    struct composition_device *device;
++    HRESULT hr;
++
++    TRACE("%p, %s, %p.\n", dxgi_device, debugstr_guid(iid), out);
++
++    if (!out)
++        return E_INVALIDARG;
++    *out = NULL;
++    if (!(device = calloc(1, sizeof(*device))))
++        return E_OUTOFMEMORY;
++    device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
++    device->refcount = 1;
++    list_init(&device->targets);
++
++    hr = IDCompositionDevice_QueryInterface(&device->IDCompositionDevice_iface, iid, out);
++    IDCompositionDevice_Release(&device->IDCompositionDevice_iface);
++    return hr;
+ }
+ 
+ HRESULT WINAPI DCompositionCreateDevice2(IUnknown *rendering_device, REFIID iid, void **device)
+diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
+index 6ecd575..7e2b8f5 100755
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -186,6 +186,15 @@ struct d3d11_swapchain
+     IDXGIOutput *target;
+     LONG present_count;
+     LONG in_set_fullscreen_state;
++
++    BOOL composition;
++    HWND composition_window;
++    ID3D11Texture2D *composition_staging;
++    HANDLE composition_section;
++    void *composition_view;
++    SIZE_T composition_size;
++    HANDLE composition_process;
++    DWORD composition_pid;
+ };
+ 
+ HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
+diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
+index c6bb47f..0b6d6d3 100755
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -390,10 +390,31 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
+         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
+ {
+-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
++    ID3D12CommandQueue *command_queue;
++    HWND window = NULL;
++    HRESULT hr;
++
++    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
+             iface, device, desc, output, swapchain);
+ 
+-    return E_NOTIMPL;
++    if (!device || !desc || !swapchain)
++        return DXGI_ERROR_INVALID_CALL;
++    if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&command_queue)))
++    {
++        ID3D12CommandQueue_Release(command_queue);
++        FIXME("D3D12 composition swapchains are not supported.\n");
++        return E_NOTIMPL;
++    }
++
++    /* A windowed swapchain on the hidden device window; dcomp later tells it which window it is shown in. */
++    if (!(window = dxgi_factory_get_device_window(factory)))
++        return E_FAIL;
++    if (FAILED(hr = IWineDXGIFactory_CreateSwapChainForHwnd(iface, device, window, desc, NULL, output, swapchain)))
++        return hr;
++    window = NULL;
++    IDXGISwapChain1_SetPrivateData(*swapchain, &WINE_DXGI_COMPOSITION_WINDOW, sizeof(window), &window);
++    return S_OK;
+ }
+ 
+ static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
+diff --git a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
+index 283c18d..a64fd01 100755
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "dxgi_private.h"
++#include "ntuser.h"
+ 
+ #define VKD3D_NO_VULKAN_H
+ #define VKD3D_NO_WIN32_TYPES
+@@ -261,6 +262,14 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
+             WARN("Releasing fullscreen swapchain.\n");
+             IDXGIOutput_Release(swapchain->target);
+         }
++        if (swapchain->composition_staging)
++            ID3D11Texture2D_Release(swapchain->composition_staging);
++        if (swapchain->composition_view)
++            UnmapViewOfFile(swapchain->composition_view);
++        if (swapchain->composition_section)
++            CloseHandle(swapchain->composition_section);
++        if (swapchain->composition_process)
++            CloseHandle(swapchain->composition_process);
+         IWineDXGIFactory_Release(swapchain->factory);
+         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
+         IWineDXGIDevice_Release(device);
+@@ -278,6 +287,16 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_SetPrivateData(IDXGISwapChain4
+ 
+     TRACE("iface %p, guid %s, data_size %u, data %p.\n", iface, debugstr_guid(guid), data_size, data);
+ 
++    if (IsEqualGUID(guid, &WINE_DXGI_COMPOSITION_WINDOW) && data && data_size == sizeof(HWND))
++    {
++        wined3d_mutex_lock();
++        swapchain->composition = TRUE;
++        swapchain->composition_window = *(const HWND *)data;
++        wined3d_mutex_unlock();
++        TRACE("Composition window %p.\n", swapchain->composition_window);
++        return S_OK;
++    }
++
+     return dxgi_set_private_data(&swapchain->private_store, guid, data_size, data);
+ }
+ 
+@@ -323,6 +342,207 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDevice(IDXGISwapChain4 *ifac
+ 
+ /* IDXGISwapChain1 methods */
+ 
++/* A composition swapchain is shown by dcomp in a window that may be a child of another
++ * process' window (Chromium's GPU process draws into the browser's window), which GL
++ * presentation does not reach. Copy back buffer 0 there with GDI instead; it is never
++ * rotated, so applications that update only the damaged part of it keep a full image. */
++/* Under winewayland only the process of a top level draws in it: if the composition window's
++ * top level is another process' (and not an X11 window, which GDI reaches from here), hand the
++ * frame to that process in a section. Returns FALSE if the frame should be drawn here. */
++static BOOL d3d11_swapchain_present_composition_remote(struct d3d11_swapchain *swapchain,
++        HWND window, const D3D11_MAPPED_SUBRESOURCE *map, UINT width, UINT height)
++{
++    HWND toplevel = GetAncestor(window, GA_ROOT);
++    struct composition_frame *frame;
++    HANDLE remote;
++    SIZE_T size;
++    DWORD pid;
++    UINT y;
++
++    if (!toplevel || !GetWindowThreadProcessId(toplevel, &pid) || pid == GetCurrentProcessId()
++            || GetPropA(toplevel, "__wine_x11_whole_window"))
++        return FALSE;
++
++    if (pid != swapchain->composition_pid)
++    {
++        if (swapchain->composition_process)
++            CloseHandle(swapchain->composition_process);
++        swapchain->composition_pid = pid;
++        if (!(swapchain->composition_process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid)))
++            ERR("Failed to open process %04lx, error %lu.\n", pid, GetLastError());
++    }
++    if (!swapchain->composition_process)
++        return TRUE;
++
++    size = sizeof(*frame) + (SIZE_T)width * 4 * height;
++    if (size > swapchain->composition_size)
++    {
++        if (swapchain->composition_view)
++            UnmapViewOfFile(swapchain->composition_view);
++        if (swapchain->composition_section)
++            CloseHandle(swapchain->composition_section);
++        swapchain->composition_view = NULL;
++        swapchain->composition_size = 0;
++        if (!(swapchain->composition_section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
++                (DWORD)((ULONGLONG)size >> 32), (DWORD)size, NULL)))
++        {
++            ERR("Failed to create a section, error %lu.\n", GetLastError());
++            return TRUE;
++        }
++        if (!(swapchain->composition_view = MapViewOfFile(swapchain->composition_section, FILE_MAP_WRITE, 0, 0, 0)))
++        {
++            ERR("Failed to map a section, error %lu.\n", GetLastError());
++            return TRUE;
++        }
++        swapchain->composition_size = size;
++    }
++
++    /* shortcut: one section for all frames, a frame that the receiver draws late may tear */
++    frame = swapchain->composition_view;
++    frame->width = width;
++    frame->height = height;
++    frame->stride = width * 4;
++    for (y = 0; y < height; ++y)
++        memcpy((BYTE *)(frame + 1) + (SIZE_T)y * frame->stride, (const BYTE *)map->pData + (SIZE_T)y * map->RowPitch,
++                frame->stride);
++
++    if (!DuplicateHandle(GetCurrentProcess(), swapchain->composition_section, swapchain->composition_process,
++            &remote, SECTION_MAP_READ | SECTION_QUERY, FALSE, 0))
++    {
++        ERR("Failed to duplicate a section handle, error %lu.\n", GetLastError());
++        return TRUE;
++    }
++    /* The receiver closes the handle, also when it handles the message after the timeout. */
++    if (!SendMessageTimeoutW(toplevel, WM_WINE_COMPOSITION_PRESENT, (WPARAM)window, (LPARAM)remote,
++            SMTO_ABORTIFHUNG, 100, NULL))
++        WARN("Top level %p did not draw the frame, error %lu.\n", toplevel, GetLastError());
++    return TRUE;
++}
++
++static HRESULT d3d11_swapchain_present_composition(struct d3d11_swapchain *swapchain, HWND window)
++{
++    BITMAPINFO info = {{sizeof(info.bmiHeader)}};
++    D3D11_TEXTURE2D_DESC desc, staging_desc;
++    ID3D11DeviceContext *context;
++    D3D11_MAPPED_SUBRESOURCE map;
++    ID3D11Texture2D *back_buffer;
++    ID3D11Device *device;
++    BOOL rgba;
++    HRESULT hr;
++    HDC dc;
++
++    /* Not shown by any composition target yet. */
++    if (!window || !IsWindow(window))
++        return S_OK;
++
++    if (FAILED(hr = IDXGISwapChain4_GetBuffer(&swapchain->IDXGISwapChain4_iface, 0,
++            &IID_ID3D11Texture2D, (void **)&back_buffer)))
++        return hr;
++    ID3D11Texture2D_GetDevice(back_buffer, &device);
++    ID3D11Texture2D_GetDesc(back_buffer, &desc);
++
++    switch (desc.Format)
++    {
++        case DXGI_FORMAT_B8G8R8A8_UNORM:
++        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++        case DXGI_FORMAT_B8G8R8X8_UNORM:
++        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++            rgba = FALSE;
++            break;
++        case DXGI_FORMAT_R8G8B8A8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++            rgba = TRUE;
++            break;
++        default:
++            FIXME("Unhandled swapchain format %#x.\n", desc.Format);
++            hr = S_OK;
++            goto done;
++    }
++
++    if (swapchain->composition_staging)
++    {
++        ID3D11Texture2D_GetDesc(swapchain->composition_staging, &staging_desc);
++        if (staging_desc.Width != desc.Width || staging_desc.Height != desc.Height || staging_desc.Format != desc.Format)
++        {
++            ID3D11Texture2D_Release(swapchain->composition_staging);
++            swapchain->composition_staging = NULL;
++        }
++    }
++    if (!swapchain->composition_staging)
++    {
++        staging_desc = desc;
++        staging_desc.Usage = D3D11_USAGE_STAGING;
++        staging_desc.BindFlags = 0;
++        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
++        staging_desc.MiscFlags = 0;
++        if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &staging_desc, NULL, &swapchain->composition_staging)))
++        {
++            ERR("Failed to create a staging texture, hr %#lx.\n", hr);
++            goto done;
++        }
++    }
++
++    ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)swapchain->composition_staging,
++            (ID3D11Resource *)back_buffer);
++    if (SUCCEEDED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)swapchain->composition_staging,
++            0, rgba ? D3D11_MAP_READ_WRITE : D3D11_MAP_READ, 0, &map)))
++    {
++        if (rgba)
++        {
++            UINT x, y;
++
++            /* GDI wants BGRA */
++            for (y = 0; y < desc.Height; ++y)
++            {
++                BYTE *p = (BYTE *)map.pData + (SIZE_T)y * map.RowPitch, t;
++                for (x = 0; x < desc.Width; ++x, p += 4)
++                {
++                    t = p[0];
++                    p[0] = p[2];
++                    p[2] = t;
++                }
++            }
++        }
++        if (d3d11_swapchain_present_composition_remote(swapchain, window, &map, desc.Width, desc.Height))
++            goto unmap;
++        info.bmiHeader.biWidth = map.RowPitch / 4;
++        info.bmiHeader.biHeight = -(LONG)desc.Height;
++        info.bmiHeader.biPlanes = 1;
++        info.bmiHeader.biBitCount = 32;
++        info.bmiHeader.biCompression = BI_RGB;
++        if ((dc = GetDC(window)))
++        {
++            SetDIBitsToDevice(dc, 0, 0, desc.Width, desc.Height, 0, 0, 0, desc.Height, map.pData, &info, DIB_RGB_COLORS);
++            ReleaseDC(window, dc);
++        }
++unmap:
++        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)swapchain->composition_staging, 0);
++        InterlockedIncrement(&swapchain->present_count);
++    }
++    ID3D11DeviceContext_Release(context);
++
++done:
++    ID3D11Device_Release(device);
++    ID3D11Texture2D_Release(back_buffer);
++    return hr;
++}
++
++/* A windowed swapchain in a child of another process' top level (Chromium's GPU process drawing
++ * in the browser's window with GPU compositing) is not shown by GL presentation under
++ * winewayland, which draws only in its own process' top levels, nor reliably under X11:
++ * present it as a composition one, with GDI (from here under X11, else through the top
++ * level's process). */
++static BOOL d3d11_swapchain_in_remote_window(struct d3d11_swapchain *swapchain)
++{
++    HWND window = d3d11_swapchain_get_hwnd(swapchain), toplevel;
++    DWORD pid;
++
++    if (!swapchain->fullscreen_desc.Windowed || !window || !(toplevel = GetAncestor(window, GA_ROOT)) || toplevel == window)
++        return FALSE;
++    return GetWindowThreadProcessId(toplevel, &pid) && pid != GetCurrentProcessId();
++}
++
+ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+         unsigned int sync_interval, unsigned int flags)
+ {
+@@ -344,6 +564,11 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+         return S_OK;
+     }
+ 
++    if (swapchain->composition)
++        return d3d11_swapchain_present_composition(swapchain, swapchain->composition_window);
++    if (d3d11_swapchain_in_remote_window(swapchain))
++        return d3d11_swapchain_present_composition(swapchain, d3d11_swapchain_get_hwnd(swapchain));
++
+     hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0);
+     if (hr == WINED3DOK_PRESENT_OCCLUDED)
+         return DXGI_STATUS_OCCLUDED;
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index bb03d9a..44d723c 100755
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -912,6 +912,44 @@ static void update_visible_region( struct dce *dce )
+     if (surface) window_surface_release( surface );
+ }
+ 
++/***********************************************************************
++ *           present_composition_frame
++ *
++ * Draw a frame that another process (dxgi's composition swapchains) put in a section, in a
++ * window of a top level of this process: only this process can draw in that top level's surface.
++ */
++void present_composition_frame( HWND hwnd, HANDLE section )
++{
++    BITMAPINFO info = {{sizeof(info.bmiHeader)}};
++    const struct composition_frame *frame;
++    void *view = NULL;
++    SIZE_T size = 0;
++    HDC hdc;
++
++    if (!NtMapViewOfSection( section, GetCurrentProcess(), &view, 0, 0, NULL, &size, ViewShare, 0, PAGE_READONLY ))
++    {
++        frame = view;
++        /* the section comes from another process: check that the frame fits in it */
++        if (size >= sizeof(*frame) && frame->width && frame->height && frame->stride / 4 >= frame->width &&
++            !(frame->stride % 4) && frame->width <= 0x8000 && frame->height <= 0x8000 &&
++            (size - sizeof(*frame)) / frame->stride >= frame->height &&
++            (hdc = NtUserGetDCEx( hwnd, 0, DCX_USESTYLE )))
++        {
++            info.bmiHeader.biWidth = frame->stride / 4;
++            info.bmiHeader.biHeight = -(LONG)frame->height;
++            info.bmiHeader.biPlanes = 1;
++            info.bmiHeader.biBitCount = 32;
++            info.bmiHeader.biCompression = BI_RGB;
++            NtGdiSetDIBitsToDeviceInternal( hdc, 0, 0, frame->width, frame->height, 0, 0, 0, frame->height,
++                                            frame + 1, &info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
++            NtUserReleaseDC( hwnd, hdc );
++        }
++        else WARN( "invalid composition frame for %p, section size %#zx\n", hwnd, (size_t)size );
++        NtUnmapViewOfSection( GetCurrentProcess(), view );
++    }
++    NtClose( section );
++}
++
+ /***********************************************************************
+  *           release_dce
+  */
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index de1a484..cbb9a17 100755
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2274,6 +2274,10 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
++    case WM_WINE_COMPOSITION_PRESENT:
++        if (NtUserGetAncestor( (HWND)wparam, GA_ROOT ) == hwnd) present_composition_frame( (HWND)wparam, (HANDLE)lparam );
++        else NtClose( (HANDLE)lparam );
++        return 0;
+     case WM_WINE_TRACKMOUSEEVENT:
+     {
+         TRACKMOUSEEVENT info;
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 4f3eea7..d8c2fe1 100755
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -247,6 +247,10 @@ extern NTSTATUS d3dkmt_swapchain_destroy_remote( D3DKMT_HANDLE local );
+ extern NTSTATUS d3dkmt_swapchain_acquire_image( D3DKMT_HANDLE local, UINT *index );
+ extern NTSTATUS d3dkmt_swapchain_queue_present( D3DKMT_HANDLE local, UINT index );
+ 
++/* dce.c */
++
++extern void present_composition_frame( HWND hwnd, HANDLE section );
++
+ /* opengl.c */
+ 
+ extern BOOL get_opengl_gpus( struct list *gpus );
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 5eae215..75115e4 100755
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -887,9 +887,10 @@ static enum wp_cursor_shape_device_v1_shape cursor_shape_from_info(ICONINFOEXW *
+     return shape;
+ }
+ 
++static BOOL wayland_pointer_set_shape(enum wp_cursor_shape_device_v1_shape shape);
++
+ static BOOL wayland_pointer_set_cursor_shape(HCURSOR hcursor)
+ {
+-    struct wayland_pointer *pointer = &process_wayland.pointer;
+     ICONINFOEXW info = {0};
+     enum wp_cursor_shape_device_v1_shape shape = 0;
+     uint32_t proto_version;
+@@ -904,7 +905,14 @@ static BOOL wayland_pointer_set_cursor_shape(HCURSOR hcursor)
+     if (info.hbmColor) NtGdiDeleteObjectApp(info.hbmColor);
+     if (info.hbmMask) NtGdiDeleteObjectApp(info.hbmMask);
+ 
+-    if (!shape) return FALSE;
++    return wayland_pointer_set_shape(shape);
++}
++
++static BOOL wayland_pointer_set_shape(enum wp_cursor_shape_device_v1_shape shape)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++
++    if (!shape || !process_wayland.wp_cursor_shape_manager_v1) return FALSE;
+ 
+     if (!pointer->wp_cursor_shape_device_v1)
+     {
+@@ -938,6 +946,7 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+     struct wayland_win_data *data;
+     double scale;
+     BOOL reapply_clip = FALSE;
++    UINT remote = 0;
+ 
+     if ((data = wayland_win_data_get(hwnd)))
+     {
+@@ -947,8 +956,17 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+             return;
+         }
+         scale = surface->window.scale;
+-        if (use_hcursor) surface->hcursor = hcursor;
+-        else hcursor = surface->hcursor;
++        if (use_hcursor)
++        {
++            surface->hcursor = hcursor;
++            surface->remote_cursor = 0;
++        }
++        else
++        {
++            hcursor = surface->hcursor;
++            remote = surface->remote_cursor;
++            if (remote == ~0u) hcursor = NULL;  /* hidden by the other process */
++        }
+         use_hcursor = TRUE;
+         wayland_win_data_release(data);
+     }
+@@ -960,7 +978,8 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+     pthread_mutex_lock(&pointer->mutex);
+     if (pointer->focused_hwnd == hwnd)
+     {
+-        if ((!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
++        if ((remote && remote != ~0u && wayland_pointer_set_shape(remote)) ||
++            (!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
+             (use_hcursor && hcursor && wayland_pointer_set_cursor_shape(hcursor)))
+         {
+             wayland_pointer_clear_cursor_surface();
+@@ -1138,10 +1157,52 @@ void wayland_pointer_clear_constraint(void)
+ /***********************************************************************
+  *           WAYLAND_SetCursor
+  */
++/* The cursor another process set over a child of the window (WM_WAYLAND_REMOTE_CURSOR) */
++void wayland_set_remote_cursor(HWND hwnd, UINT shape)
++{
++    struct wayland_win_data *data;
++
++    TRACE("hwnd=%p shape %#x\n", hwnd, shape);
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if (data->wayland_surface) data->wayland_surface->remote_cursor = shape;
++    wayland_win_data_release(data);
++    wayland_set_cursor(hwnd, NULL, FALSE);
++}
++
++/* A window in a top level of another process (Chromium's browser process in the launcher's
++ * window): the pointer is that process' surface, and only it can set the cursor. It gets the
++ * cursor as a shape. shortcut: cursors that are not a system one show as the default arrow, and
++ * a compositor without cursor-shape-v1 shows none; send the image for those if one needs it. */
++static BOOL wayland_set_cursor_in_remote_toplevel(HWND hwnd, HCURSOR hcursor)
++{
++    HWND toplevel = hwnd ? NtUserGetAncestor(hwnd, GA_ROOT) : 0;
++    ICONINFOEXW info = {0};
++    UINT shape = ~0u;
++    DWORD pid;
++
++    if (!toplevel || !NtUserGetWindowThread(toplevel, &pid) || pid == GetCurrentProcessId()) return FALSE;
++    if (hcursor)
++    {
++        shape = 0;
++        if (get_icon_info(hcursor, &info))
++        {
++            shape = cursor_shape_from_info(&info, process_wayland.wp_cursor_shape_manager_v1 ?
++                wp_cursor_shape_manager_v1_get_version(process_wayland.wp_cursor_shape_manager_v1) : 1);
++            if (info.hbmColor) NtGdiDeleteObjectApp(info.hbmColor);
++            if (info.hbmMask) NtGdiDeleteObjectApp(info.hbmMask);
++        }
++        if (!shape) shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
++    }
++    TRACE("hwnd=%p toplevel=%p of pid %04x, shape %#x\n", hwnd, toplevel, (int)pid, shape);
++    NtUserPostMessage(toplevel, WM_WAYLAND_REMOTE_CURSOR, 0, shape);
++    return TRUE;
++}
++
+ void WAYLAND_SetCursor(HWND hwnd, HCURSOR hcursor)
+ {
+     TRACE("hwnd=%p hcursor=%p\n", hwnd, hcursor);
+ 
++    if (wayland_set_cursor_in_remote_toplevel(hwnd, hcursor)) return;
+     wayland_set_cursor(hwnd, hcursor, TRUE);
+ }
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 4a04a9d..524e8bb 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -75,6 +75,7 @@ enum wayland_window_message
+     WM_WAYLAND_DND,            /* drag and drop into the window, wparam: enum wayland_dnd_step */
+     WM_WAYLAND_KEYBOARD_LEAVE, /* the window lost the keyboard focus */
+     WM_WAYLAND_ALIGN_WINDOW,   /* move the window by (wparam, lparam): where the compositor shows it */
++    WM_WAYLAND_REMOTE_CURSOR,  /* lparam: the cursor shape another process set over the window, ~0 = none */
+ };
+ 
+ enum wayland_surface_config_state
+@@ -327,6 +328,7 @@ struct wayland_surface
+     struct wayland_window_config window;
+     int content_width, content_height;
+     HCURSOR hcursor;
++    UINT remote_cursor;       /* shape set by another process over a child of it (WM_WAYLAND_REMOTE_CURSOR), 0 = none */
+ };
+ 
+ /**********************************************************************
+@@ -501,6 +503,7 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
+ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+ void wayland_dnd_window_message(HWND hwnd, WPARAM step);
+ void wayland_keyboard_deactivate(HWND hwnd);
++void wayland_set_remote_cursor(HWND hwnd, UINT shape);
+ HWND wayland_pointer_get_focused_toplevel(void);
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 0655539..47364d1 100755
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -737,6 +737,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_KEYBOARD_LEAVE:
+         wayland_keyboard_deactivate(hwnd);
+         return 0;
++    case WM_WAYLAND_REMOTE_CURSOR:
++        wayland_set_remote_cursor(hwnd, lp);
++        return 0;
+     case WM_WAYLAND_ALIGN_WINDOW:
+     {
+         struct wayland_win_data *data;
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index 64f400d..6839fa2 100755
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -1449,12 +1449,21 @@ void X11DRV_DestroyCursorIcon( HCURSOR handle )
+ void X11DRV_SetCursor( HWND hwnd, HCURSOR handle )
+ {
+     struct x11drv_win_data *data;
++    HWND toplevel;
++    Window window;
++    DWORD pid;
+ 
+     if ((data = get_win_data( hwnd )))
+     {
+         set_window_cursor( data->whole_window, handle );
+         release_win_data( data );
+     }
++    /* a window in a top level of another process (Chromium's browser process in a launcher's
++     * window): its X window is the display's, so the cursor is set on it from here */
++    else if (hwnd && (toplevel = NtUserGetAncestor( hwnd, GA_ROOT )) && toplevel != hwnd &&
++             NtUserGetWindowThread( toplevel, &pid ) && pid != GetCurrentProcessId() &&
++             (window = X11DRV_get_whole_window( toplevel )))
++        set_window_cursor( window, handle );
+ 
+     if (clipping_cursor) set_window_cursor( x11drv_thread_data()->clip_window, handle );
+ }
+diff --git a/include/ntuser.h b/include/ntuser.h
+index ad0eccb..eba73d6 100755
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -643,12 +643,23 @@ enum wine_internal_message
+     WM_WINE_SWAPCHAIN_PRESENT,
+     WM_WINE_SWAPCHAIN_DESTROY,
+     WM_WINE_SETPIXELFORMAT,
++    WM_WINE_COMPOSITION_PRESENT,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
+     WM_WINE_LAST_DRIVER_MSG = 0x80001fff
+ };
+ 
++/* WM_WINE_COMPOSITION_PRESENT: wparam is a window of the receiving thread's top level, lparam a
++ * section handle duplicated into the receiving process (closed by it) holding this header and
++ * top-down 32-bit BGRX rows, drawn at the window's client origin. */
++struct composition_frame
++{
++    UINT width;
++    UINT height;
++    UINT stride;
++};
++
+ /* internal IME message */
+ #define WM_IME_INTERNAL 0x287
+ #define IME_INTERNAL_ACTIVATE   0x17
+diff --git a/include/wine/winedxgi.idl b/include/wine/winedxgi.idl
+index fff00de..3818acc 100755
+--- a/include/wine/winedxgi.idl
++++ b/include/wine/winedxgi.idl
+@@ -20,6 +20,10 @@
+ 
+ import "dxgi1_6.idl";
+ 
++/* SetPrivateData() with this GUID and a HWND on a swapchain made by CreateSwapChainForComposition()
++ * makes Present() show it in that window (NULL: nowhere); used by dcomp. */
++cpp_quote("DEFINE_GUID(WINE_DXGI_COMPOSITION_WINDOW, 0x6b0f2c5e, 0x3d7a, 0x4f61, 0x9a, 0x2e, 0x5c, 0x41, 0x8d, 0x07, 0xb3, 0x92);")
++
+ [
+     object,
+     local,
+diff --git a/server/queue.c b/server/queue.c
+index 2449f0c..76ab458 100755
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -543,6 +543,7 @@ static int update_desktop_cursor_pos( struct desktop *desktop, user_handle_t win
+ 
+     if (!win || !is_window_visible( win ) || is_window_transparent( win ))
+         win = shallow_window_from_point( desktop, x, y );
++    win = cursor_window_from_point( win, x, y );
+     if (update_desktop_cursor_window( desktop, win )) updated = 1;
+ 
+     return updated;
+diff --git a/server/user.h b/server/user.h
+index f1a1f07..870dfab 100755
+--- a/server/user.h
++++ b/server/user.h
+@@ -182,6 +182,7 @@ extern int make_window_active( user_handle_t window );
+ extern struct thread *get_window_thread( user_handle_t handle );
+ extern user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y );
+ extern struct thread *window_thread_from_point( user_handle_t scope, int x, int y );
++extern user_handle_t cursor_window_from_point( user_handle_t scope, int x, int y );
+ extern user_handle_t find_window_to_repaint( user_handle_t parent, struct thread *thread );
+ extern struct window_class *get_window_class( user_handle_t window );
+ extern void set_window_rect_visible( user_handle_t window, struct rectangle rect );
+diff --git a/server/window.c b/server/window.c
+index 3cd82b0..a551c6c 100755
+--- a/server/window.c
++++ b/server/window.c
+@@ -1070,6 +1070,23 @@ struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
+     return (struct thread *)grab_object( win->thread );
+ }
+ 
++/* the window under the point (in absolute raw coords) in top-level 'scope' when it belongs to
++ * another process (Chromium's browser process in a launcher's window): its thread gets the mouse
++ * messages and sets the cursor, so it is the cursor window; else 'scope' */
++user_handle_t cursor_window_from_point( user_handle_t scope, int x, int y )
++{
++    struct window *top = get_user_object( scope, NTUSER_OBJ_WINDOW ), *win;
++
++    if (!top || !top->thread || top == top->desktop->top_window) return scope;
++    if (!get_monitor_dpi( top ).den) return scope;  /* not placed on a monitor yet: would divide by 0 */
++
++    map_point_raw_to_virt( top->desktop, &x, &y );
++    screen_to_client( top, &x, &y, no_dpi );
++    win = child_window_from_point( top, x, y );
++    if (!win->thread || win->thread->process == top->thread->process) return scope;
++    return win->handle;
++}
++
+ /* return list of all windows containing point (in absolute coords) */
+ static int all_windows_from_point( struct window *top, int x, int y, struct ratio dpi,
+                                    struct user_handle_array *array )

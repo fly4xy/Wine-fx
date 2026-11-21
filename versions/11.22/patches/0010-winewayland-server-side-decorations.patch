@@ -1,0 +1,395 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: The desktop's frame for windows with a caption (xdg-decoration).
+
+Under Wayland, Wine drew windows with a caption (UnrealGameSync, installers, Wine's own tools)
+with a frame and title bar of Windows inside the surface, where winex11 leaves them to the
+window manager.
+
+With a compositor that offers zxdg_decoration_manager_v1 (KWin, GNOME, wlroots), every toplevel
+gets a decoration object, and its mode follows the window: server-side for a managed window with
+a caption whose visible rect is not its whole window rect, client-side otherwise. That is what
+winex11 decides: windows that took the frame area for their client, even only the caption's
+(Unreal's, which draw their own title bar; Tauri's maximized ones, the new Epic Games Launcher),
+or with Decorated off, get no frame from the desktop. GetWindowStyleMasks tells win32u that the desktop
+draws the caption and the border: they leave the visible rect, the surface, and are not drawn.
+The size the compositor configures is then the surface's, the visible rect, and the window rect
+gets what the frame stands for around it; a configure without a size keeps the window's own.
+xdg-decoration-unstable-v1.xml is the one of wayland-protocols (MIT).
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index 411d045..afe7902 100755
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -31,6 +31,7 @@ SOURCES = \
+ 	window.c \
+ 	window_surface.c \
+ 	wlr-data-control-unstable-v1.xml \
++	xdg-decoration-unstable-v1.xml \
+ 	xdg-output-unstable-v1.xml \
+ 	xdg-shell.xml \
+ 	xdg-toplevel-icon-v1.xml
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 118ee2d..9310a16 100755
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -189,6 +189,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         process_wayland.wl_data_device_manager =
+             wl_registry_bind(registry, id, &wl_data_device_manager_interface, 2);
+     }
++    else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0)
++    {
++        process_wayland.zxdg_decoration_manager_v1 =
++            wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
++    }
+     else if (strcmp(interface, "xdg_toplevel_icon_manager_v1") == 0)
+     {
+         process_wayland.xdg_toplevel_icon_manager_v1 =
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index a1b1587..f94a5af 100755
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -436,6 +436,13 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
+     if (!surface->xdg_toplevel) goto err;
+     xdg_toplevel_add_listener(surface->xdg_toplevel, &xdg_toplevel_listener, surface->hwnd);
+ 
++    /* The desktop's frame, for the windows that have one: its mode follows the window's style
++     * and rects (wayland_win_data_update_decoration). Created now, before the first commit. */
++    if (process_wayland.zxdg_decoration_manager_v1)
++        surface->xdg_toplevel_decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
++            process_wayland.zxdg_decoration_manager_v1, surface->xdg_toplevel);
++    surface->xdg_decoration_mode = 0;
++
+     /* WINEWMCLASS: the app_id to give the windows, as the window class for winex11 (Epic Games'
+      * winex11-set-wm-class patch): what the desktop matches with StartupWMClass of a menu entry */
+     if ((app_id = getenv("WINEWMCLASS")) && *app_id)
+@@ -540,6 +547,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ 
+         if (surface->xdg_toplevel)
+         {
++            /* before its toplevel, as the protocol wants */
++            if (surface->xdg_toplevel_decoration)
++            {
++                zxdg_toplevel_decoration_v1_destroy(surface->xdg_toplevel_decoration);
++                surface->xdg_toplevel_decoration = NULL;
++            }
+             xdg_toplevel_destroy(surface->xdg_toplevel);
+             surface->xdg_toplevel = NULL;
+         }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 7caa23a..4d5206e 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -34,6 +34,7 @@
+ #include "relative-pointer-unstable-v1-client-protocol.h"
+ #include "text-input-unstable-v3-client-protocol.h"
+ #include "viewporter-client-protocol.h"
++#include "xdg-decoration-unstable-v1-client-protocol.h"
+ #include "xdg-output-unstable-v1-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
+@@ -187,6 +188,7 @@ struct wayland
+     struct zwlr_data_control_manager_v1 *zwlr_data_control_manager_v1;
+     struct wl_data_device_manager *wl_data_device_manager;
+     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
++    struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1;
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
+     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
+@@ -302,6 +304,8 @@ struct wayland_surface
+             struct xdg_surface *xdg_surface;
+             struct xdg_toplevel *xdg_toplevel;
+             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
++            struct zxdg_toplevel_decoration_v1 *xdg_toplevel_decoration;
++            uint32_t xdg_decoration_mode;  /* the mode we asked for, 0 = none yet */
+         };
+         struct
+         {
+@@ -481,6 +485,8 @@ BOOL WAYLAND_SetCursorPos(INT x, INT y);
+ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags);
+ void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small);
+ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
++BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
++BOOL wayland_style_has_frame(UINT style, UINT ex_style);
+ void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
+ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
+ void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 60b8017..59680b8 100755
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -41,6 +41,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
++    .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pDestroyWindow = WAYLAND_DestroyWindow,
+     .pSetIMECompositionRect = WAYLAND_SetIMECompositionRect,
+     .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 83388a4..bac1c88 100755
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -290,6 +290,24 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+     }
+ }
+ 
++/* The desktop's frame for managed windows with a caption, as winex11 decides: not for those that
++ * made the frame part of their client area (Unreal's windows draw their own title bar). */
++static void wayland_win_data_update_decoration(struct wayland_win_data *data)
++{
++    struct wayland_surface *surface = data->wayland_surface;
++    uint32_t mode = ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
++
++    if (!surface->xdg_toplevel_decoration) return;
++    if (data->managed && !EqualRect(&data->rects.window, &data->rects.visible) &&
++        wayland_style_has_frame(NtUserGetWindowLongW(data->hwnd, GWL_STYLE),
++                                NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE)))
++        mode = ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
++    if (mode == surface->xdg_decoration_mode) return;
++    TRACE("hwnd=%p decoration mode %u\n", data->hwnd, mode);
++    zxdg_toplevel_decoration_v1_set_mode(surface->xdg_toplevel_decoration, mode);
++    surface->xdg_decoration_mode = mode;
++}
++
+ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+ {
+     struct wayland_surface *surface = data->wayland_surface;
+@@ -300,6 +318,7 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         if (!surface->xdg_surface) break; /* surface role has been cleared */
++        wayland_win_data_update_decoration(data);
+         wayland_surface_update_state_toplevel(surface);
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+@@ -623,7 +642,18 @@ static void wayland_configure_window(HWND hwnd)
+ 
+     SetRect(&rect, 0, 0, width, height);
+     rect = map_rect_from_surface(surface, rect);
+-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
++    if (rect.left == rect.right || rect.bottom == rect.top) flags |= SWP_NOSIZE;
++    else
++    {
++        /* the configured size is the surface's, the visible rect: the window rect has around it
++         * what the desktop's frame stands for (WAYLAND_GetWindowStyleMasks); without one they
++         * are equal */
++        OffsetRect(&rect, data->rects.visible.left, data->rects.visible.top);
++        rect.left -= data->rects.visible.left - data->rects.window.left;
++        rect.top -= data->rects.visible.top - data->rects.window.top;
++        rect.right += data->rects.window.right - data->rects.visible.right;
++        rect.bottom += data->rects.window.bottom - data->rects.visible.bottom;
++    }
+ 
+     wayland_win_data_release(data);
+ 
+@@ -633,7 +663,6 @@ static void wayland_configure_window(HWND hwnd)
+     if (needs_exit_size_move) send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
+ 
+     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
+-    if (rect.left == rect.right || rect.bottom == rect.top) flags |= SWP_NOSIZE;
+ 
+     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+     if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE)
+@@ -690,6 +719,36 @@ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     return NtUserMessageCall(hwnd, msg, wp, lp, 0, NtUserDefWindowProc, FALSE);
+ }
+ 
++/* Windows the desktop frames when it can (xdg-decoration), as winex11 decides for X11 */
++BOOL wayland_style_has_frame(UINT style, UINT ex_style)
++{
++    if (ex_style & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) return FALSE;
++    return (style & WS_CAPTION) == WS_CAPTION;
++}
++
++/*****************************************************************
++ *		WAYLAND_GetWindowStyleMasks
++ *
++ * The parts of the frame the desktop draws: win32u leaves them out of the visible rect, the
++ * surface, and does not draw them. Managed windows with a caption, when the compositor has
++ * xdg-decoration. shortcut: assumes the compositor takes the server-side mode we ask for (KWin,
++ * GNOME with it, wlroots do); a compositor answering client-side would show no frame at all.
++ */
++BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask)
++{
++    struct wayland_win_data *data;
++    BOOL framed = process_wayland.zxdg_decoration_manager_v1 && wayland_style_has_frame(style, ex_style);
++
++    if (framed && (data = wayland_win_data_get(hwnd)))
++    {
++        if (!data->managed) framed = FALSE;
++        wayland_win_data_release(data);
++    }
++    *style_mask = framed ? WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME : 0;
++    *ex_style_mask = framed ? WS_EX_DLGMODALFRAME : 0;
++    return TRUE;
++}
++
+ /*****************************************************************
+  *		WAYLAND_SetLayeredWindowAttributes
+  */
+diff --git a/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml b/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+new file mode 100644
+index 0000000..82ca247
+--- /dev/null
++++ b/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+@@ -0,0 +1,160 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="xdg_decoration_unstable_v1">
++  <copyright>
++    Copyright © 2018 Simon Ser
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <interface name="zxdg_decoration_manager_v1" version="1">
++    <description summary="window decoration manager">
++      This interface allows a compositor to announce support for server-side
++      decorations.
++
++      A window decoration is a set of window controls as deemed appropriate by
++      the party managing them, such as user interface components used to move,
++      resize and change a window's state.
++
++      A client can use this protocol to request being decorated by a supporting
++      compositor.
++
++      If compositor and client do not negotiate the use of a server-side
++      decoration using this protocol, clients continue to self-decorate as they
++      see fit.
++
++      Warning! The protocol described in this file is experimental and
++      backward incompatible changes may be made. Backward compatible changes
++      may be added together with the corresponding interface version bump.
++      Backward incompatible changes are done by bumping the version number in
++      the protocol and interface names and resetting the interface version.
++      Once the protocol is to be declared stable, the 'z' prefix and the
++      version number in the protocol and interface names are removed and the
++      interface version number is reset.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the decoration manager object">
++        Destroy the decoration manager. This doesn't destroy objects created
++        with the manager.
++      </description>
++    </request>
++
++    <request name="get_toplevel_decoration">
++      <description summary="create a new toplevel decoration object">
++        Create a new decoration object associated with the given toplevel.
++
++        Creating an xdg_toplevel_decoration from an xdg_toplevel which has a
++        buffer attached or committed is a client error, and any attempts by a
++        client to attach or manipulate a buffer prior to the first
++        xdg_toplevel_decoration.configure event must also be treated as
++        errors.
++      </description>
++      <arg name="id" type="new_id" interface="zxdg_toplevel_decoration_v1"/>
++      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
++    </request>
++  </interface>
++
++  <interface name="zxdg_toplevel_decoration_v1" version="1">
++    <description summary="decoration object for a toplevel surface">
++      The decoration object allows the compositor to toggle server-side window
++      decorations for a toplevel surface. The client can request to switch to
++      another mode.
++
++      The xdg_toplevel_decoration object must be destroyed before its
++      xdg_toplevel.
++    </description>
++
++    <enum name="error">
++      <entry name="unconfigured_buffer" value="0"
++        summary="xdg_toplevel has a buffer attached before configure"/>
++      <entry name="already_constructed" value="1"
++        summary="xdg_toplevel already has a decoration object"/>
++      <entry name="orphaned" value="2"
++        summary="xdg_toplevel destroyed before the decoration object"/>
++      <entry name="invalid_mode" value="3" summary="invalid mode"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the decoration object">
++        Switch back to a mode without any server-side decorations at the next
++        commit.
++      </description>
++    </request>
++
++    <enum name="mode">
++      <description summary="window decoration modes">
++        These values describe window decoration modes.
++      </description>
++      <entry name="client_side" value="1"
++        summary="no server-side window decoration"/>
++      <entry name="server_side" value="2"
++        summary="server-side window decoration"/>
++    </enum>
++
++    <request name="set_mode">
++      <description summary="set the decoration mode">
++        Set the toplevel surface decoration mode. This informs the compositor
++        that the client prefers the provided decoration mode.
++
++        After requesting a decoration mode, the compositor will respond by
++        emitting an xdg_surface.configure event. The client should then update
++        its content, drawing it without decorations if the received mode is
++        server-side decorations. The client must also acknowledge the configure
++        when committing the new content (see xdg_surface.ack_configure).
++
++        The compositor can decide not to use the client's mode and enforce a
++        different mode instead.
++
++        Clients whose decoration mode depend on the xdg_toplevel state may send
++        a set_mode request in response to an xdg_surface.configure event and wait
++        for the next xdg_surface.configure event to prevent unwanted state.
++        Such clients are responsible for preventing configure loops and must
++        make sure not to send multiple successive set_mode requests with the
++        same decoration mode.
++
++        If an invalid mode is supplied by the client, the invalid_mode protocol
++        error is raised by the compositor.
++      </description>
++      <arg name="mode" type="uint" enum="mode" summary="the decoration mode"/>
++    </request>
++
++    <request name="unset_mode">
++      <description summary="unset the decoration mode">
++        Unset the toplevel surface decoration mode. This informs the compositor
++        that the client doesn't prefer a particular decoration mode.
++
++        This request has the same semantics as set_mode.
++      </description>
++    </request>
++
++    <event name="configure">
++      <description summary="notify a decoration mode change">
++        The configure event configures the effective decoration mode. The
++        configured state should not be applied immediately. Clients must send an
++        ack_configure in response to this event. See xdg_surface.configure and
++        xdg_surface.ack_configure for details.
++
++        A configure event can be sent at any time. The specified mode must be
++        obeyed by the client.
++      </description>
++      <arg name="mode" type="uint" enum="mode" summary="the decoration mode"/>
++    </event>
++  </interface>
++</protocol>

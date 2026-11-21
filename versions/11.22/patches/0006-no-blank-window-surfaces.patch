@@ -1,0 +1,235 @@
+From: Wine Fox
+Subject: [PATCH] win32u, winex11, winewayland: No white or black flash of window surfaces nothing was drawn on; WINE_BLANK_COLOR.
+
+* win32u, winex11: Do not show a window surface nothing was drawn on.
+
+A window surface starts filled with white, and exposing a window (when it is mapped) flushed all
+of it. Windows that draw only through Vulkan or OpenGL never draw on it: Unreal Engine's menus,
+popups and tooltips showed a white rectangle (Wayland) until their first frame, and on X11 a
+black one, the background the X server fills a window with when it is mapped.
+
+The surface remembers whether anything was drawn on it, and an expose of a surface that is
+still blank shows nothing; moving the bits of a blank surface to a new one does not make that
+one drawn. X11 windows get no background, so the X server leaves them alone until they draw.
+
+* win32u: A window surface is drawn only when pixels of it changed.
+
+Patch 0013 marked a window surface drawn whenever something locked it to draw. A paint that draws
+nothing locks it too: the empty frame of a window whose non-client area is gone, as Unreal
+Engine's windows, made their surfaces drawn, and growing such a window showed the blank part of
+its new surface (white) next to the last frame of Vulkan. Drawn now means that the drawing
+bounds of the surface are not empty when it is unlocked.
+
+* win32u, winex11, winewayland: WINE_BLANK_COLOR, the colour of what is not drawn yet.
+
+Where a window has not drawn yet (shown before its first frame, the new part of a window being
+resized) it showed white (a new window surface), black (an X window) or nothing (the placeholder
+buffer of winewayland). With WINE_BLANK_COLOR=RRGGBB they show that colour instead: the
+background of the application makes such moments much less visible (Unreal Engine: 242424).
+Without the variable nothing changes. An experiment.
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc8..bb03d9a 100755
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -552,6 +552,29 @@ static void *window_surface_get_color( struct window_surface *surface, BITMAPINF
+     return gdi_bits.ptr;
+ }
+ 
++#include <stdlib.h>
++/* WINE_BLANK_COLOR=RRGGBB: what windows show where nothing is drawn yet, instead of white
++ * (or black, or nothing): the background colour of the application, so that a window that is
++ * resized or shown before its first frame does not flash (Unreal Engine's theme: 242424).
++ * -1 when not set. */
++static int get_blank_color(void)
++{
++    static int color = -2;
++    const char *env;
++
++    if (color == -2)
++    {
++        color = -1;
++        if ((env = getenv( "WINE_BLANK_COLOR" )) && *env)
++        {
++            char *end;
++            long value = strtol( env[0] == '#' ? env + 1 : env, &end, 16 );
++            if (!*end && value >= 0 && value <= 0xffffff) color = value;
++        }
++    }
++    return color;
++}
++
+ struct window_surface *window_surface_create( const struct window_surface_funcs *funcs, HWND hwnd,
+                                               const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
+ {
+@@ -577,6 +600,11 @@ struct window_surface *window_surface_create( const struct window_surface_funcs
+     pthread_mutex_init( &surface->mutex, NULL );
+ 
+     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
++    if (get_blank_color() != -1 && info->bmiHeader.biBitCount == 32)
++    {
++        UINT *bits = window_surface_get_color( surface, info ), i;
++        for (i = 0; i < info->bmiHeader.biSizeImage / 4; i++) bits[i] = 0xff000000 | get_blank_color();
++    }
+ 
+     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
+     return surface;
+@@ -1689,6 +1717,13 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
+     RECT dst = valid_rects[0];
+     RECT src = valid_rects[1];
+ 
++    /* nothing was drawn there: copying the blank would make the new surface look drawn */
++    if (!old_surface->drawn)
++    {
++        NtUserReleaseDC( hwnd, hdc );
++        return;
++    }
++
+     TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
+     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
+     OffsetRect( &dst, -window_rect->left, -window_rect->top );
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+index 8a72d97..c2105a3 100755
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -533,6 +533,9 @@ static inline void unlock_surface( struct windrv_physdev *dev )
+     if (!--dev->lock_count)
+     {
+         DWORD ticks = NtGetTickCount() - surface->draw_start_ticks;
++        /* drawn only when pixels changed: a paint that draws nothing (the empty frame of a window
++         * whose non-client area is gone, as Unreal Engine's) leaves the surface blank */
++        if (!IsRectEmpty( dev->dibdrv->bounds )) surface->drawn = TRUE;
+         window_surface_unlock( surface );
+         if (ticks > FLUSH_PERIOD) window_surface_flush( dev->surface );
+     }
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 4f0610c..fa7fce1 100755
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2537,6 +2537,14 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
+     }
+ 
+     window_surface_lock( surface );
++    /* Nothing drawn yet: the surface is only its initial fill (white). Windows that draw through
++     * Vulkan or OpenGL, Unreal Engine's menus and popups, showed it before their first frame. */
++    if (!surface->drawn)
++    {
++        window_surface_unlock( surface );
++        window_surface_release( surface );
++        return TRUE;
++    }
+     if (!rect) add_bounds_rect( &surface->bounds, &surface->rect );
+     else
+     {
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index e715840..a1b1587 100755
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1568,6 +1568,28 @@ static const struct wl_buffer_listener dummy_buffer_listener =
+     dummy_buffer_release
+ };
+ 
++/* WINE_BLANK_COLOR=RRGGBB: what windows show where nothing is drawn yet, instead of white
++ * (or black, or nothing): the background colour of the application, so that a window that is
++ * resized or shown before its first frame does not flash (Unreal Engine's theme: 242424).
++ * -1 when not set. */
++static int get_blank_color(void)
++{
++    static int color = -2;
++    const char *env;
++
++    if (color == -2)
++    {
++        color = -1;
++        if ((env = getenv( "WINE_BLANK_COLOR" )) && *env)
++        {
++            char *end;
++            long value = strtol( env[0] == '#' ? env + 1 : env, &end, 16 );
++            if (!*end && value >= 0 && value <= 0xffffff) color = value;
++        }
++    }
++    return color;
++}
++
+ /**********************************************************************
+  *          wayland_surface_ensure_contents
+  *
+@@ -1601,6 +1623,12 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface)
+     }
+     wl_buffer_add_listener(dummy_shm_buffer->wl_buffer, &dummy_buffer_listener,
+                            dummy_shm_buffer);
++    if (get_blank_color() != -1)
++    {
++        UINT32 *pixels = dummy_shm_buffer->map_data;
++        size_t i;
++        for (i = 0; i < dummy_shm_buffer->map_size / 4; i++) pixels[i] = 0xff000000 | get_blank_color();
++    }
+ 
+     if (!(damage = NtGdiCreateRectRgn(0, 0, width, height)))
+         WARN("Failed to create damage region for dummy buffer\n");
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 239500b..6ccfbac 100755
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -511,6 +511,28 @@ static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD st
+ }
+ 
+ 
++/* WINE_BLANK_COLOR=RRGGBB: what windows show where nothing is drawn yet, instead of white
++ * (or black, or nothing): the background colour of the application, so that a window that is
++ * resized or shown before its first frame does not flash (Unreal Engine's theme: 242424).
++ * -1 when not set. */
++static int get_blank_color(void)
++{
++    static int color = -2;
++    const char *env;
++
++    if (color == -2)
++    {
++        color = -1;
++        if ((env = getenv( "WINE_BLANK_COLOR" )) && *env)
++        {
++            char *end;
++            long value = strtol( env[0] == '#' ? env + 1 : env, &end, 16 );
++            if (!*end && value >= 0 && value <= 0xffffff) color = value;
++        }
++    }
++    return color;
++}
++
+ /***********************************************************************
+  *              get_window_attributes
+  *
+@@ -525,14 +547,18 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
+     attr->bit_gravity       = NorthWestGravity;
+     attr->backing_store     = NotUseful;
+     attr->border_pixel      = 0;
+-    attr->background_pixel  = 0;
++    /* no background: the X server would fill the window with it when it is mapped, before the
++     * window has drawn anything (a black flash of popups drawn through Vulkan or OpenGL);
++     * or the application's own colour (WINE_BLANK_COLOR) */
++    attr->background_pixmap = None;
++    attr->background_pixel  = get_blank_color() != -1 ? get_blank_color() : 0;
+     attr->event_mask        = (ExposureMask | KeyPressMask | KeyReleaseMask |
+                                FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
+     /* for transparent windows, exclude mouse events to allow mouse pass-through */
+     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
+                                                               ButtonReleaseMask | EnterWindowMask);
+ 
+-    return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
++    return (CWSaveUnder | CWColormap | CWBorderPixel | (get_blank_color() != -1 ? CWBackPixel : CWBackPixmap) |
+             CWEventMask | CWBitGravity | CWBackingStore);
+ }
+ 
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index a66b7aa..cf38096 100755
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -328,6 +328,7 @@ struct window_surface
+     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
+     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
+     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
++    BOOL                               drawn;        /* something was drawn on it: its colors are worth showing */
+     /* driver-specific fields here */
+ };
+ 

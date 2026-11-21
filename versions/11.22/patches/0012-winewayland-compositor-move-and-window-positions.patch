@@ -1,0 +1,303 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Moves and resizes by the compositor; toplevels kept where the compositor shows them.
+
+* winewayland: Release the button after a move or resize by the compositor.
+
+SC_MOVE and SC_SIZE hand the window to the compositor (xdg_toplevel_move, xdg_toplevel_resize),
+which then gets the release of the button that started them: the window never does, so the
+button stayed down for the application. Unreal Engine's windows ignored clicks after a resize
+and could not be sized again. winex11 fakes the release once the window manager is done; under
+Wayland the window gets no more of that button, so it is released right away.
+
+The sizes of an interactive resize Wine asked for are applied even without the resizing state:
+wlroots compositors (labwc, sway) send them without it, and the window never changed size
+there. Until the pointer enters one of the process's surfaces again, the end of the grab.
+
+* winewayland: Keep toplevels where the compositor shows them, as far as the pointer tells.
+
+Wayland does not tell where toplevels are. A window Wine did not place keeps the position the
+application asked for, and the pointer over it gets screen coordinates that are off by as much,
+often out of the screen, where they are clamped: a tab Unreal Engine drags out of a floating
+window stuck away from the pointer, and clicks on its caption buttons hit the caption.
+
+The window's position in Wine's coordinates is moved (WM_WAYLAND_ALIGN_WINDOW, the application
+gets WM_MOVE) when the pointer tells where it is:
+- the pointer goes straight from one window into another (within 100 ms): it is at the same place
+  in both, so the window entered moves to match the one left, or the one left to match the one
+  entered when that one is maximized or fullscreen (where Wine thinks it is);
+- the pointer over a window would be out of the screen in Wine's coordinates: the pointer is on
+  the screen, so the window moves by as much.
+Moves asked and not done yet count for the next pointer events.
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index dcde2dc..5eae215 100755
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -136,6 +136,7 @@ static HWND wayland_pointer_get_focused_hwnd(void)
+ 
+ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+ {
++    POINT align = {0};
+     INPUT input = {0};
+     RECT *window_rect;
+     HWND hwnd;
+@@ -154,8 +155,25 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+     window_rect = &surface->window.rect;
+ 
+     screen = map_point_from_surface(surface, screen);
+-    screen.x += window_rect->left;
+-    screen.y += window_rect->top;
++    screen.x += window_rect->left + surface->align.x;
++    screen.y += window_rect->top + surface->align.y;
++    /* The pointer is on the screen: out of it in Wine's coordinates, the window is not where Wine
++     * thinks (see align_windows_on_enter), by as much at least. */
++    if (wayland_surface_is_toplevel(surface) &&
++        !(surface->window.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                                   WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)))
++    {
++        RECT vs = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
++
++        if (screen.x < vs.left) align.x = vs.left - screen.x;
++        else if (screen.x >= vs.right) align.x = vs.right - 1 - screen.x;
++        if (screen.y < vs.top) align.y = vs.top - screen.y;
++        else if (screen.y >= vs.bottom) align.y = vs.bottom - 1 - screen.y;
++        surface->align.x += align.x;
++        surface->align.y += align.y;
++        screen.x += align.x;
++        screen.y += align.y;
++    }
+     /* Sometimes, due to rounding, we may end up with pointer coordinates
+      * slightly outside the target window, so bring them within bounds.
+      * Only those: while a button is held the window keeps getting the pointer far outside it,
+@@ -168,6 +186,18 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+ 
+     wayland_win_data_release(data);
+ 
++    if (align.x || align.y)
++    {
++        TRACE("hwnd=%p by %d,%d: the pointer is on the screen\n", hwnd, (int)align.x, (int)align.y);
++        NtUserPostMessage(hwnd, WM_WAYLAND_ALIGN_WINDOW, align.x, align.y);
++    }
++
++    pthread_mutex_lock(&process_wayland.pointer.mutex);
++    process_wayland.pointer.last_pos = screen;
++    process_wayland.pointer.last_time = NtGetTickCount();
++    process_wayland.pointer.last_hwnd = hwnd;
++    pthread_mutex_unlock(&process_wayland.pointer.mutex);
++
+     input.type = INPUT_MOUSE;
+     input.mi.dx = screen.x;
+     input.mi.dy = screen.y;
+@@ -193,6 +223,83 @@ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+ 
+ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor);
+ 
++/* Moves the window's position in Wine's coordinates by dx, dy (WM_WAYLAND_ALIGN_WINDOW) */
++static void queue_align(HWND hwnd, int dx, int dy)
++{
++    struct wayland_win_data *data = wayland_win_data_get(hwnd);
++
++    if (!data) return;
++    if (data->wayland_surface)
++    {
++        data->wayland_surface->align.x += dx;
++        data->wayland_surface->align.y += dy;
++    }
++    wayland_win_data_release(data);
++    NtUserPostMessage(hwnd, WM_WAYLAND_ALIGN_WINDOW, dx, dy);
++}
++
++/* The window's position in Wine's screen coordinates and whether it is where the compositor shows
++ * it (maximized, fullscreen: on its monitor). FALSE when it is not a toplevel. */
++static BOOL get_toplevel_origin(HWND hwnd, POINT *pos, BOOL *anchored)
++{
++    struct wayland_win_data *data = wayland_win_data_get(hwnd);
++    struct wayland_surface *surface;
++    BOOL ret = FALSE;
++
++    if (!data) return FALSE;
++    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
++    {
++        *pos = map_point_from_surface(surface, *pos);
++        pos->x += surface->window.rect.left + surface->align.x;
++        pos->y += surface->window.rect.top + surface->align.y;
++        *anchored = !!(surface->window.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                                                 WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN));
++        ret = TRUE;
++    }
++    wayland_win_data_release(data);
++    return ret;
++}
++
++/* Wayland does not tell where toplevels are: a window Wine did not place keeps the position the
++ * application asked for, and the pointer over it gets coordinates that are off by as much, out of
++ * the screen often, where they are clamped (a tab Unreal Engine drags out of a floating window
++ * stuck away from the pointer). When the pointer goes straight from one window into another, it
++ * is at the same place in both: the window entered, or the one left when the one entered is
++ * maximized or fullscreen and so where Wine thinks it is, is moved to match. */
++static void align_windows_on_enter(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    POINT last, pos = {wl_fixed_to_double(sx), wl_fixed_to_double(sy)}, other = {0};
++    BOOL anchored, other_anchored;
++    DWORD last_time;
++    HWND from;
++    int dx, dy;
++
++    pthread_mutex_lock(&pointer->mutex);
++    last = pointer->last_pos;
++    last_time = pointer->last_time;
++    from = pointer->last_hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++
++    /* shortcut: only straight crossings (100 ms), not through the desktop or other applications */
++    if (!from || from == hwnd || NtGetTickCount() - last_time > 100) return;
++    if (!get_toplevel_origin(hwnd, &pos, &anchored)) return;
++    dx = last.x - pos.x;
++    dy = last.y - pos.y;
++    if (abs(dx) <= 2 && abs(dy) <= 2) return;
++
++    if (!anchored)
++    {
++        TRACE("hwnd=%p by %d,%d, as %p\n", hwnd, dx, dy, from);
++        queue_align(hwnd, dx, dy);
++    }
++    else if (get_toplevel_origin(from, &other, &other_anchored) && !other_anchored)
++    {
++        TRACE("hwnd=%p by %d,%d, as %p\n", from, -dx, -dy, hwnd);
++        queue_align(from, -dx, -dy);
++    }
++}
++
+ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+                                  uint32_t serial, struct wl_surface *wl_surface,
+                                  wl_fixed_t sx, wl_fixed_t sy)
+@@ -209,6 +316,17 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+ 
+     TRACE("hwnd=%p\n", hwnd);
+ 
++    {
++        struct wayland_win_data *data = wayland_win_data_get(hwnd);
++        if (data)
++        {
++            if (data->wayland_surface) data->wayland_surface->interactive_resize = FALSE;
++            wayland_win_data_release(data);
++        }
++    }
++
++    align_windows_on_enter(hwnd, sx, sy);
++
+     pthread_mutex_lock(&pointer->mutex);
+     pointer->focused_hwnd = hwnd;
+     pointer->enter_serial = serial;
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 1a9693b..5358fb3 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -74,6 +74,7 @@ enum wayland_window_message
+     WM_WAYLAND_SET_FOREGROUND,
+     WM_WAYLAND_DND,            /* drag and drop into the window, wparam: enum wayland_dnd_step */
+     WM_WAYLAND_KEYBOARD_LEAVE, /* the window lost the keyboard focus */
++    WM_WAYLAND_ALIGN_WINDOW,   /* move the window by (wparam, lparam): where the compositor shows it */
+ };
+ 
+ enum wayland_surface_config_state
+@@ -121,6 +122,9 @@ struct wayland_pointer
+     BOOL pending_warp;
+     uint32_t enter_serial;
+     uint32_t button_serial;
++    POINT last_pos;     /* where the last motion put the pointer, in Wine's screen coordinates */
++    DWORD last_time;    /* and when */
++    HWND last_hwnd;     /* over which window */
+     struct wayland_cursor cursor;
+     double accum_x;
+     double accum_y;
+@@ -317,6 +321,8 @@ struct wayland_surface
+ 
+     struct wayland_surface_config pending, requested, processing, current;
+     BOOL resizing;
++    BOOL interactive_resize;  /* we asked the compositor to resize it (SC_SIZE), until the pointer is back */
++    POINT align;              /* moves asked by WM_WAYLAND_ALIGN_WINDOW and not done yet */
+     struct wayland_window_config window;
+     int content_width, content_height;
+     HCURSOR hcursor;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index bac1c88..c126826 100755
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -574,8 +574,10 @@ static void wayland_configure_window(HWND hwnd)
+ 
+     state = surface->processing.state;
+     /* Ignore size hints if we don't have a state that requires strict
+-     * size adherence, in order to avoid spurious resizes. */
+-    if (state)
++     * size adherence, in order to avoid spurious resizes. The sizes of an interactive resize
++     * we started are wanted too: wlroots compositors (labwc, sway) send them without the
++     * resizing state. */
++    if (state || surface->interactive_resize)
+     {
+         width = surface->processing.rect.right - surface->processing.rect.left;
+         height = surface->processing.rect.bottom - surface->processing.rect.top;
+@@ -705,6 +707,23 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_KEYBOARD_LEAVE:
+         wayland_keyboard_deactivate(hwnd);
+         return 0;
++    case WM_WAYLAND_ALIGN_WINDOW:
++    {
++        struct wayland_win_data *data;
++        RECT rect;
++
++        if (!(data = wayland_win_data_get(hwnd))) return 0;
++        rect = data->rects.window;
++        if (data->wayland_surface)
++        {
++            data->wayland_surface->align.x -= (int)wp;
++            data->wayland_surface->align.y -= (int)lp;
++        }
++        wayland_win_data_release(data);
++        OffsetRect(&rect, (int)wp, (int)lp);
++        NtUserSetRawWindowPos(hwnd, rect, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER, FALSE);
++        return 0;
++    }
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;
+@@ -862,6 +881,7 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT
+     struct wl_seat *wl_seat;
+     struct wayland_surface *surface;
+     struct wayland_win_data *data;
++    BOOL grabbed = FALSE;
+ 
+     TRACE("cmd=%lx hwnd=%p, %lx, %lx\n",
+           (long)command, hwnd, (long)wparam, lparam);
+@@ -890,7 +910,9 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT
+                 {
+                     xdg_toplevel_resize(surface->xdg_toplevel, wl_seat, button_serial,
+                                         hittest_to_resize_edge(wparam & 0x0f));
++                    surface->interactive_resize = TRUE;
+                 }
++                grabbed = TRUE;
+             }
+             pthread_mutex_unlock(&process_wayland.seat.mutex);
+             wayland_win_data_release(data);
+@@ -898,6 +920,20 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT
+         }
+     }
+ 
++    /* The compositor moves or sizes the window now and gets the button's release, the window
++     * never does: release it, as winex11 does once the window manager is done, or the button
++     * stays down for the application (Unreal's windows ignored clicks after a resize). */
++    if (grabbed)
++    {
++        INPUT input = {.type = INPUT_MOUSE};
++
++        if (NtUserGetKeyState(VK_LBUTTON) & 0x8000) input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
++        else if (NtUserGetKeyState(VK_RBUTTON) & 0x8000) input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
++        else if (NtUserGetKeyState(VK_MBUTTON) & 0x8000) input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
++        TRACE("hwnd=%p releasing %#x\n", hwnd, (int)input.mi.dwFlags);
++        if (input.mi.dwFlags) NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    }
++
+     wl_display_flush(process_wayland.wl_display);
+     return ret;
+ }

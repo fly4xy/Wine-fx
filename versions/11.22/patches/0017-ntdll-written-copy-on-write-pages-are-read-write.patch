@@ -1,0 +1,30 @@
+From: Wine Fox
+Subject: [PATCH] ntdll: VirtualProtect gives the old protection of copy-on-write pages as read-write.
+
+Chromium (libcef: Battle.net, other CEF programs) makes a writable section of its own image read-only
+after writing it, and checks that VirtualProtect gives PAGE_READWRITE as the old protection: on
+Windows a copy-on-write page that was written is a private read-write page. Wine does not track the
+written pages and gave PAGE_WRITECOPY: libcef stopped itself (int3, exception 0x80000003), Battle.net's
+render process died again and again and Battle.net closed. NtProtectVirtualMemory now gives the old
+protection of copy-on-write pages as read-write (execute-read-write); the protection itself and
+NtQueryVirtualMemory stay as they are. An unwritten copy-on-write page is given as read-write too:
+telling them apart needs tracking of the copied pages.
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 84f2a39..06f7120 100755
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5343,6 +5343,13 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
+         if (get_committed_size( view, base, size, &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED))
+         {
+             old = get_win32_prot( vprot, view->protect );
++            /* Wine does not track which copy-on-write pages were written: on Windows those are
++             * private read-write pages by then, which Chromium (libcef: Battle.net, Steam...)
++             * checks when it seals its writable sections, else it stops itself (int3).
++             * shortcut: an unwritten copy-on-write page is reported as read-write too, real
++             * tracking of the copied pages (as wine-staging does) would tell them apart */
++            if (old & PAGE_WRITECOPY) old = (old & ~PAGE_WRITECOPY) | PAGE_READWRITE;
++            else if (old & PAGE_EXECUTE_WRITECOPY) old = (old & ~PAGE_EXECUTE_WRITECOPY) | PAGE_EXECUTE_READWRITE;
+             status = set_protection( view, base, size, new_prot );
+         }
+         else status = STATUS_NOT_COMMITTED;

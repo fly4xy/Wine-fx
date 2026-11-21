@@ -1,0 +1,42 @@
+From: Wine Fox
+Subject: [PATCH] winex11: Activated captionless tool popups stay unmanaged.
+
+Unreal Engine activates its menus (popups with WS_EX_TOOLWINDOW and no caption) for their search
+field. winex11 manages activated windows: the menu, already shown override-redirect, was mapped
+again for the window manager, placed by it, and under KWin the next resize of the menu was cut
+(the first category expanded in Niagara's "+" menu). Such popups now stay override-redirect when
+activated and get the X input focus as other unmanaged windows do.
+
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 4db0607..40a1712 100755
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -444,9 +444,17 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
+     /* child windows are not managed */
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
+-    /* activated windows are managed */
+-    if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+-    if (hwnd == get_active_window()) return TRUE;
++    ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
++    /* activated windows are managed, but captionless tool popups (Unreal Engine's menus, which it
++     * activates for their search field) stay override-redirect and get the X focus as such: taken
++     * over when activated, they were mapped again and placed by the window manager, and KWin cut
++     * the next resize of the menu (a category expanded under Niagara's "+") */
++    if (!(style & WS_POPUP) || (style & (WS_CAPTION | WS_THICKFRAME | WS_SYSMENU)) ||
++        (ex_style & (WS_EX_TOOLWINDOW | WS_EX_APPWINDOW)) != WS_EX_TOOLWINDOW)
++    {
++        if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
++        if (hwnd == get_active_window()) return TRUE;
++    }
+     /* windows with caption are managed */
+     if ((style & WS_CAPTION) == WS_CAPTION) return TRUE;
+     /* windows with thick frame are managed */
+@@ -459,7 +467,6 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
+         if (fullscreen) return TRUE;
+     }
+     /* application windows are managed */
+-    ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+     if (ex_style & WS_EX_APPWINDOW) return TRUE;
+     /* windows that own popups are managed */
+     if (has_owned_popups( hwnd )) return TRUE;

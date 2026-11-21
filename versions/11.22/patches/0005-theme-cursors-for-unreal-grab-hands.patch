@@ -1,0 +1,145 @@
+From: Wine Fox
+Subject: [PATCH] user32, winex11, winewayland: Theme cursors for Unreal Engine's grab hands.
+
+Unreal Engine loads its grab hands (shown over Content Browser items and other things that can
+be dragged) from Engine/Content/Editor/Slate/Cursor/grabhand.cur and grabhand_closed.cur, white
+Windows hands that ignore the desktop's cursor theme.
+
+A cursor loaded from a file now keeps the file as its module (it had none), and the display
+drivers recognise these two files: winex11 loads "grab"/"openhand" and "grabbing"/"closedhand"
+from the cursor theme, winewayland asks for the grab and grabbing cursor shapes. Such a cursor is
+never shared, and CopyImage(LR_COPYFROMRESOURCE) finds no module of that name, so nothing else
+changes for them. X11's HKCU\Software\Wine\X11 Driver\Cursors can map them too ("grabhand.cur,0").
+
+diff --git a/dlls/user32/cursoricon.c b/dlls/user32/cursoricon.c
+index c9a5ef8..f28264e 100755
+--- a/dlls/user32/cursoricon.c
++++ b/dlls/user32/cursoricon.c
+@@ -956,6 +956,16 @@ static HICON create_cursoricon_object( struct cursoricon_desc *desc, BOOL is_ico
+     if (!(handle = NtUserCreateCursorIcon( is_icon ))) return 0;
+ 
+     if (module) LdrGetDllFullName( module, &module_name );
++    else if (resname && !IS_INTRESOURCE( resname ))
++    {
++        /* loaded from a file (CURSORICON_LoadFromFile): the file is kept as its module, so that
++         * display drivers can recognise cursor files of applications (the grab hands of Unreal
++         * Engine) and show the desktop's own cursor for them. Never shared (LR_SHARED is dropped
++         * for files), and CopyImage(LR_COPYFROMRESOURCE) finds no such module. */
++        lstrcpynW( buf, resname, ARRAY_SIZE(buf) );
++        module_name.Length = lstrlenW( buf ) * sizeof(WCHAR);
++        resname = NULL;
++    }
+ 
+     res_str.Buffer = (WCHAR *)resname;
+     if (!IS_INTRESOURCE(resname))
+@@ -1345,8 +1355,9 @@ static HICON CURSORICON_LoadFromFile( LPCWSTR filename,
+ 
+     hotspot.x = entry->xHotspot;
+     hotspot.y = entry->yHotspot;
++    /* NULL module and the file as the name: see create_cursoricon_object */
+     hIcon = create_icon_from_bmi( (const BITMAPINFO *)&bits[entry->dwDIBOffset], filesize - entry->dwDIBOffset,
+-                                  NULL, NULL, NULL, hotspot, !fCursor, width, height, loadflags );
++                                  NULL, filename, NULL, hotspot, !fCursor, width, height, loadflags );
+ end:
+     TRACE("loaded %s -> %p\n", debugstr_w( filename ), hIcon );
+     UnmapViewOfFile( bits );
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index ed6deda..c564568 100755
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -694,6 +694,33 @@ static void reapply_cursor_clipping(void)
+     NtUserSetThreadDpiAwarenessContext(context);
+ }
+ 
++/* cursor files of applications that stand for a cursor of the desktop's theme, by file name */
++static const struct
++{
++    const char *file;
++    enum wp_cursor_shape_device_v1_shape shape;
++} file_cursors[] =
++{
++    /* Unreal Engine: Engine/Content/Editor/Slate/Cursor */
++    {"grabhand.cur",        WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB},
++    {"grabhand_closed.cur", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING},
++};
++
++static enum wp_cursor_shape_device_v1_shape file_cursor_shape(const WCHAR *path)
++{
++    const WCHAR *p = path, *base = path;
++    char file[32];
++    unsigned int i, len;
++
++    for (; *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
++    for (len = 0; base[len] && len < sizeof(file) - 1; len++)
++        file[len] = base[len] >= 'A' && base[len] <= 'Z' ? base[len] + 32 : base[len] < 0x80 ? base[len] : '?';
++    file[len] = 0;
++    for (i = 0; i < ARRAY_SIZE(file_cursors); i++)
++        if (!strcmp(file, file_cursors[i].file)) return file_cursors[i].shape;
++    return 0;
++}
++
+ static enum wp_cursor_shape_device_v1_shape cursor_shape_from_info(ICONINFOEXW *info,
+                                                                    uint32_t proto_version)
+ {
+@@ -703,6 +730,8 @@ static enum wp_cursor_shape_device_v1_shape cursor_shape_from_info(ICONINFOEXW *
+     enum wp_cursor_shape_device_v1_shape shape = 0;
+ 
+     if (!info->szModName[0]) return 0;
++    /* cursors loaded from a file have it as their module */
++    if ((shape = file_cursor_shape(info->szModName))) return shape;
+     if ((module = wcsrchr(info->szModName, '\\'))) module++;
+     else module = info->szModName;
+     for (i = 0; i < ARRAY_SIZE(module_cursors); i++)
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index cb79ed5..64f400d 100755
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -964,6 +964,34 @@ static int find_fallback_shape( const char *name )
+     return -1;
+ }
+ 
++/* cursor files of applications that stand for a cursor of the desktop's theme, by file name */
++static const struct
++{
++    const char *file;
++    const char *names[8];
++} file_cursors[] =
++{
++    /* Unreal Engine: Engine/Content/Editor/Slate/Cursor */
++    { "grabhand.cur",        { "grab", "openhand", "hand1" }},
++    { "grabhand_closed.cur", { "grabbing", "closedhand", "fleur" }},
++};
++
++/* the theme cursor names for a cursor loaded from the file path, NULL if none */
++static const char * const *file_cursor_names( const WCHAR *path )
++{
++    const WCHAR *p = path, *base = path;
++    char file[32];
++    unsigned int i, len;
++
++    for (; *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
++    for (len = 0; base[len] && len < sizeof(file) - 1; len++)
++        file[len] = base[len] >= 'A' && base[len] <= 'Z' ? base[len] + 32 : base[len] < 0x80 ? base[len] : '?';
++    file[len] = 0;
++    for (i = 0; i < ARRAY_SIZE( file_cursors ); i++)
++        if (!strcmp( file, file_cursors[i].file )) return file_cursors[i].names;
++    return NULL;
++}
++
+ /***********************************************************************
+  *		create_xcursor_system_cursor
+  *
+@@ -1014,6 +1042,13 @@ static Cursor create_xcursor_system_cursor( const ICONINFOEXW *info )
+ 
+     if (info->szResName[0]) goto done;  /* only integer resources are supported here */
+ 
++    /* cursors loaded from a file have it as their module */
++    if ((names = file_cursor_names( info->szModName )))
++    {
++        strcpy( valueA, names[0] );
++        goto done;
++    }
++
+     if ((module = wcsrchr( info->szModName, '\\' ))) module++;
+     else module = info->szModName;
+     for (i = 0; i < ARRAY_SIZE( module_cursors ); i++)

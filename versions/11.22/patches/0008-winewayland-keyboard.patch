@@ -1,0 +1,237 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Keyboard focus, lock keys, the Delete key and the IME layout as on Windows.
+
+* winewayland: Deactivate our window when another application takes the keyboard.
+
+When the keyboard focus went to another application (a file dialog of the desktop), the Wine
+window stayed the foreground window, so getting the keyboard back activated nothing and the
+application got no WM_ACTIVATE. Unreal Engine gives the keyboard back to its viewport or Content
+Browser on activation: after a file dialog, shortcuts such as Ctrl+Space and Delete went
+nowhere and the viewport did not get the focus back.
+
+On keyboard leave the window's thread makes the desktop the foreground window when no window of
+ours got the keyboard meanwhile, as winex11 does on FocusOut.
+
+* winewayland: Keep NumLock and CapsLock in step with the compositor.
+
+winewayland ignored the lock state of wl_keyboard.modifiers, and Wine toggled its own NumLock
+and CapsLock only on the presses it saw. With NumLock turned on by the desktop at login (KDE
+Plasma's default) or pressed in another application, Wine had it the other way round: the keypad
+typed digits only with NumLock off. On each modifiers event, a lock key whose state differs
+from the compositor's is now pressed and released, as winex11 does in update_lock_state.
+
+* winewayland: The Delete keys have no character.
+
+xkb gives DEL (0x7f) for the Delete keys, and winewayland's layout tables made it their character:
+MapVirtualKey(VK_DELETE, MAPVK_VK_TO_CHAR) returned 0x7f and ToUnicode a WM_CHAR, where Windows
+gives none. Unreal Engine's Content Browser takes a key with a character for the "quick jump"
+typing and swallows it, so Delete did not delete assets there under Wayland. The layout tables no
+longer get DEL as a character (winex11 already drops it in ToUnicodeEx).
+
+* winewayland: The IME keyboard layout only once the input method sends text.
+
+KWin gives the text input to the focused window when no input method runs, and winewayland
+activated the IME keyboard layout on every text input enter: every key then reached applications
+as VK_PROCESSKEY before the key itself, where Windows with a plain layout sends the key only.
+Unreal Engine took VK_PROCESSKEY for a key of its own: its Content Drawer closed on the first
+letter typed into its search field. The IME layout now comes with the first preedit or commit
+from the compositor's input method, as winex11 does with XIM, and goes on text input leave.
+
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+index 5154e03..ba2cc48 100755
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -570,7 +570,9 @@ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap
+             xkb_state_update_mask(xkb_state, 0, 0, mod_mask, 0, 0, xkb_group);
+ 
+             if (mod_mask & control_mask) vkey2wch.wch[mod] = WCH_NONE; /* on Windows CTRL+key behave specifically */
+-            else if (!(ret = xkb_state_key_get_utf32(xkb_state, keyc))) vkey2wch.wch[mod] = WCH_NONE;
++            /* xkb gives DEL for the Delete keys, which have no character on Windows: applications take
++             * one for a typed character (Unreal Engine's Content Browser swallowed Delete) */
++            else if (!(ret = xkb_state_key_get_utf32(xkb_state, keyc)) || ret == 0x7f) vkey2wch.wch[mod] = WCH_NONE;
+             else vkey2wch.wch[mod] = ret;
+ 
+             if (vkey2wch.wch[mod] != WCH_NONE) found = TRUE;
+@@ -578,7 +580,7 @@ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap
+             xkb_state_update_mask(xkb_state, 0, 0, mod_mask | capslock_mask, 0, 0, xkb_group);
+ 
+             if (mod_mask & control_mask) caps_vkey2wch.wch[mod] = WCH_NONE; /* on Windows CTRL+key behave specifically */
+-            else if (!(ret = xkb_state_key_get_utf32(xkb_state, keyc))) caps_vkey2wch.wch[mod] = WCH_NONE;
++            else if (!(ret = xkb_state_key_get_utf32(xkb_state, keyc)) || ret == 0x7f) caps_vkey2wch.wch[mod] = WCH_NONE;
+             else if (ret == vkey2wch.wch[mod]) caps_vkey2wch.wch[mod] = WCH_NONE;
+             else caps_vkey2wch.wch[mod] = ret;
+ 
+@@ -639,7 +641,7 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+     keyboard_hkl = hkl;
+ 
+     pthread_mutex_lock(&text_input->mutex);
+-    ime = text_input->focused_hwnd == keyboard->focused_hwnd;
++    ime = text_input->focused_hwnd == keyboard->focused_hwnd && text_input->ime_used;
+     pthread_mutex_unlock(&text_input->mutex);
+ 
+     activate_keyboard_hkl(keyboard->focused_hwnd, ime);
+@@ -846,7 +848,26 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
+      * and for any key repetition to stop. */
+     release_all_keys(hwnd);
+ 
+-    /* FIXME: update foreground window as well */
++    NtUserPostMessage(hwnd, WM_WAYLAND_KEYBOARD_LEAVE, 0, 0);
++}
++
++/* In the thread of the window that lost the keyboard focus: when another application has it now
++ * (no window of ours got it meanwhile), the foreground window is no longer ours, as winex11 does
++ * on FocusOut. Applications then get WM_ACTIVATE when they get it back: Unreal Engine gives
++ * the keyboard back to its viewport or Content Browser then, after a file dialog of the desktop,
++ * and without it shortcuts such as Ctrl+Space and Delete went nowhere. */
++void wayland_keyboard_deactivate(HWND hwnd)
++{
++    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    HWND focused, foreground = NtUserGetForegroundWindow();
++
++    pthread_mutex_lock(&keyboard->mutex);
++    focused = keyboard->focused_hwnd;
++    pthread_mutex_unlock(&keyboard->mutex);
++
++    if (focused || !foreground || NtUserGetAncestor(foreground, GA_ROOT) != NtUserGetAncestor(hwnd, GA_ROOT)) return;
++    TRACE("hwnd %p lost the keyboard to another application\n", hwnd);
++    NtUserSetForegroundWindow(NtUserGetDesktopWindow());
+ }
+ 
+ static void send_right_control(HWND hwnd, uint32_t state)
+@@ -885,16 +906,40 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
+     NtUserSendHardwareInput(hwnd, 0, &input, 0);
+ }
+ 
++/* The lock keys toggled while no window of ours had the keyboard (NumLock that the desktop
++ * turns on at login, or pressed in another application): Wine only toggles them on the
++ * presses it sees, and then had NumLock the other way round (the keypad typed digits only
++ * with NumLock off). Adjust them to what the compositor says, as winex11 does. */
++static void sync_lock_key(HWND hwnd, int active, WORD vkey, WORD scan, DWORD flags)
++{
++    BYTE keystate[256];
++    INPUT input = {0};
++
++    if (active < 0 || !NtUserGetAsyncKeyboardState(keystate)) return;
++    if (!(keystate[vkey] & 0x01) == !active) return;
++    TRACE("adjusting vkey %#x to %d (%#.2x)\n", vkey, active, keystate[vkey]);
++
++    input.type = INPUT_KEYBOARD;
++    input.ki.wVk = vkey;
++    input.ki.wScan = scan;
++    input.ki.dwFlags = flags;
++    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    input.ki.dwFlags = flags | KEYEVENTF_KEYUP;
++    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++}
++
+ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
+                                       uint32_t serial, uint32_t mods_depressed,
+                                       uint32_t mods_latched, uint32_t mods_locked,
+                                       uint32_t xkb_group)
+ {
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    int num, caps;
++    HWND hwnd;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+-    if (!wayland_keyboard_get_focused_hwnd()) return;
++    if (!(hwnd = wayland_keyboard_get_focused_hwnd())) return;
+ 
+     TRACE("serial=%u mods_depressed=%#x mods_latched=%#x mods_locked=%#x xkb_group=%d stub!\n",
+           serial, mods_depressed, mods_latched, mods_locked, xkb_group);
+@@ -902,8 +947,13 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
+     pthread_mutex_lock(&keyboard->mutex);
+     xkb_state_update_mask(keyboard->xkb_state, mods_depressed, mods_latched,
+                           mods_locked, 0, 0, xkb_group);
++    num = xkb_state_mod_name_is_active(keyboard->xkb_state, XKB_MOD_NAME_NUM, XKB_STATE_MODS_LOCKED);
++    caps = xkb_state_mod_name_is_active(keyboard->xkb_state, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_LOCKED);
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
++    sync_lock_key(hwnd, num, VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY);
++    sync_lock_key(hwnd, caps, VK_CAPITAL, 0x3a, 0);
++
+     set_current_xkb_group(xkb_group);
+ 
+     /* FIXME: Sync wine modifier state with XKB modifier state. */
+diff --git a/dlls/winewayland.drv/wayland_text_input.c b/dlls/winewayland.drv/wayland_text_input.c
+index e8fcc89..f67e3ba 100755
+--- a/dlls/winewayland.drv/wayland_text_input.c
++++ b/dlls/winewayland.drv/wayland_text_input.c
+@@ -99,9 +99,12 @@ static void text_input_enter(void *data, struct zwp_text_input_v3 *zwp_text_inpu
+             ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+     zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3, 0, 0, 0, 0);
+     zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
++    text_input->ime_used = FALSE;
+     pthread_mutex_unlock(&text_input->mutex);
+-
+-    activate_keyboard_hkl(hwnd, TRUE);
++    /* Compositors (KWin) give the text input to focused windows with no input method running:
++     * the IME layout only comes with the first text from an input method, as winex11 does with
++     * XIM. Under it every key reached applications as VK_PROCESSKEY first, which Unreal Engine
++     * took for a key of its own (its Content Drawer closed on the first letter typed). */
+ }
+ 
+ static void text_input_leave(void *data, struct zwp_text_input_v3 *zwp_text_input_v3,
+@@ -116,8 +119,10 @@ static void text_input_leave(void *data, struct zwp_text_input_v3 *zwp_text_inpu
+     if (text_input->focused_hwnd)
+     {
+         post_ime_update(text_input->focused_hwnd, 0, NULL, NULL);
++        if (text_input->ime_used) activate_keyboard_hkl(text_input->focused_hwnd, FALSE);
+         text_input->focused_hwnd = NULL;
+     }
++    text_input->ime_used = FALSE;
+     wayland_text_input_reset_all_state(text_input);
+     pthread_mutex_unlock(&text_input->mutex);
+ }
+@@ -180,6 +185,8 @@ static void text_input_done(void *data, struct zwp_text_input_v3 *zwp_text_input
+          (text_input->preedit.string && text_input->current_preedit.string &&
+           wcscmp(text_input->preedit.string, text_input->current_preedit.string))))
+     {
++        if (!text_input->ime_used) activate_keyboard_hkl(text_input->focused_hwnd, TRUE);
++        text_input->ime_used = TRUE;
+         post_ime_update(text_input->focused_hwnd, text_input->preedit.cursor_pos,
+                 text_input->preedit.string, text_input->commit_string);
+     }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 6fe1a51..8ea9d61 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -72,6 +72,7 @@ enum wayland_window_message
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
+     WM_WAYLAND_DND,            /* drag and drop into the window, wparam: enum wayland_dnd_step */
++    WM_WAYLAND_KEYBOARD_LEAVE, /* the window lost the keyboard focus */
+ };
+ 
+ enum wayland_surface_config_state
+@@ -135,6 +136,7 @@ struct wayland_text_input
+     } preedit, current_preedit;
+     WCHAR *commit_string;
+     HWND focused_hwnd;
++    BOOL ime_used;  /* the input method sent text since the window got the text input */
+     pthread_mutex_t mutex;
+ };
+ 
+@@ -485,6 +487,7 @@ void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
+ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);
+ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+ void wayland_dnd_window_message(HWND hwnd, WPARAM step);
++void wayland_keyboard_deactivate(HWND hwnd);
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 09d6732..5a769c5 100755
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -629,6 +629,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_DND:
+         wayland_dnd_window_message(hwnd, wp);
+         return 0;
++    case WM_WAYLAND_KEYBOARD_LEAVE:
++        wayland_keyboard_deactivate(hwnd);
++        return 0;
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;

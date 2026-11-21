@@ -1,0 +1,32 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Take the app_id from WINEWMCLASS.
+
+Epic Games' winex11-set-wm-class patch lets WINEWMCLASS set the window class, which the
+desktop matches with StartupWMClass of a menu entry (the icon in the task bar, grouping).
+Under Wayland the app_id plays that part and was always the executable's name.
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 9b6bcb5..19c6aa4 100755
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -417,6 +417,7 @@ static void wayland_surface_init_fractional_scale(struct wayland_surface *surfac
+ void wayland_surface_make_toplevel(struct wayland_surface *surface)
+ {
+     WCHAR text[1024];
++    const char *app_id;
+ 
+     TRACE("surface=%p\n", surface);
+ 
+@@ -435,7 +436,11 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
+     if (!surface->xdg_toplevel) goto err;
+     xdg_toplevel_add_listener(surface->xdg_toplevel, &xdg_toplevel_listener, surface->hwnd);
+ 
+-    if (process_name)
++    /* WINEWMCLASS: the app_id to give the windows, as the window class for winex11 (Epic Games'
++     * winex11-set-wm-class patch): what the desktop matches with StartupWMClass of a menu entry */
++    if ((app_id = getenv("WINEWMCLASS")) && *app_id)
++        xdg_toplevel_set_app_id(surface->xdg_toplevel, app_id);
++    else if (process_name)
+         xdg_toplevel_set_app_id(surface->xdg_toplevel, process_name);
+ 
+     if (!NtUserInternalGetWindowText(surface->hwnd, text, ARRAY_SIZE(text)))

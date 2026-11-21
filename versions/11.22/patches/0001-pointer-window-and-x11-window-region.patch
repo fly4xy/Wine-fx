@@ -1,0 +1,294 @@
+From: Wine Fox
+Subject: [PATCH] winex11, winewayland: Window regions of client surfaces under X11; whether the pointer is over a Wine window.
+
+* winex11: Window regions of client surfaces; whether the pointer is over a Wine window.
+
+Tooltips and popups of programs that draw with Vulkan or OpenGL (Unreal Engine) were black
+outside their window region, or cut off: a client window that draws directly now gets the
+window's region as its X shape, and gives it back to the window surface when it is detached.
+The driver also answers whether the X window under the pointer is one of Wine's
+(X11DRV_QUERY_POINTER_WINDOW, cached briefly): user32's WindowFromPoint uses it so that
+tooltips do not show over other applications covering Wine's windows.
+
+* winewayland: Answer whether the cursor is over a Wine window.
+
+WindowFromPoint() (patch 0002) asks the display driver whether the cursor is over one of our
+windows, with the X11 driver's escape: the server only knows Wine windows and returns ours
+also when another application covers them, so Unreal Engine's tooltips stayed on top of
+other applications. Under Wayland nothing answered and the tooltips stayed.
+
+Wayland tells a client when the pointer enters and leaves its surfaces. The driver gets a
+display DC driver for the escape: with no surface of this process under the pointer, the
+cursor is over another application, unless the window there belongs to another Wine process
+(only that process knows).
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 0c190a9..ed6deda 100755
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -1083,3 +1083,74 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
+ 
+     return TRUE;
+ }
++
++/* WindowFromPoint() in user32 (Wine Fox) asks the display driver whether the cursor is over
++ * one of our windows: the server knows only Wine windows and returns ours also when another
++ * application covers them, so tooltips of such windows (Unreal Engine's) stay on top of other
++ * applications. The query is the escape of the X11 driver (see dlls/winex11.drv/x11drv.h). */
++#define X11DRV_ESCAPE 6789
++#define X11DRV_QUERY_POINTER_WINDOW 4
++
++struct query_pointer_window
++{
++    int   code;      /* X11DRV_QUERY_POINTER_WINDOW */
++    POINT pos;       /* the cursor position the answer is for */
++    BOOL  over_wine; /* the cursor is over a Wine window */
++};
++
++/* Wayland tells a client when the pointer enters and leaves its surfaces: with no surface of
++ * this process under the pointer, it is over another application, or over a window of another
++ * Wine process, which only that process knows. */
++static BOOL wayland_pointer_over_wine(POINT *pos)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    BOOL have_pointer;
++    HWND focused, hwnd;
++    DWORD pid;
++
++    NtUserGetCursorPos(pos);
++
++    pthread_mutex_lock(&pointer->mutex);
++    have_pointer = pointer->wl_pointer != NULL;
++    focused = pointer->focused_hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++
++    if (!have_pointer || focused) return TRUE;
++    hwnd = NtUserWindowFromPoint(pos->x, pos->y);
++    if (hwnd && NtUserGetWindowThread(hwnd, &pid) && pid != GetCurrentProcessId()) return TRUE;
++    TRACE("cursor at %s is over another application\n", wine_dbgstr_point(pos));
++    return FALSE;
++}
++
++/* The display DC driver, for the escape above only. */
++BOOL WAYLAND_CreateDC(PHYSDEV *pdev, LPCWSTR device, LPCWSTR output, const DEVMODEW *devmode)
++{
++    PHYSDEV physdev = calloc(1, sizeof(*physdev));
++
++    if (!physdev) return FALSE;
++    push_dc_driver(pdev, physdev, get_display_driver_funcs());
++    return TRUE;
++}
++
++BOOL WAYLAND_DeleteDC(PHYSDEV dev)
++{
++    free(dev);
++    return TRUE;
++}
++
++INT WAYLAND_ExtEscape(PHYSDEV dev, INT escape, INT in_count, LPCVOID in_data,
++                      INT out_count, LPVOID out_data)
++{
++    if (escape == X11DRV_ESCAPE && in_data && in_count >= sizeof(int) &&
++        *(const int *)in_data == X11DRV_QUERY_POINTER_WINDOW &&
++        out_count >= sizeof(struct query_pointer_window))
++    {
++        struct query_pointer_window *query = out_data;
++
++        query->code = X11DRV_QUERY_POINTER_WINDOW;
++        query->over_wine = wayland_pointer_over_wine(&query->pos);
++        return TRUE;
++    }
++    dev = GET_NEXT_PHYSDEV(dev, pExtEscape);
++    return dev->funcs->pExtEscape(dev, escape, in_count, in_data, out_count, out_data);
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 1cb525b..21dd9ae 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -420,6 +420,10 @@ void activate_keyboard_hkl(HWND hwnd, BOOL ime);
+ void wayland_pointer_init(struct wl_pointer *wl_pointer);
+ void wayland_pointer_deinit(void);
+ void wayland_pointer_clear_constraint(void);
++const struct gdi_dc_funcs *get_display_driver_funcs(void);
++BOOL WAYLAND_CreateDC(PHYSDEV *pdev, LPCWSTR device, LPCWSTR output, const DEVMODEW *devmode);
++BOOL WAYLAND_DeleteDC(PHYSDEV dev);
++INT WAYLAND_ExtEscape(PHYSDEV dev, INT escape, INT in_count, LPCVOID in_data, INT out_count, LPVOID out_data);
+ 
+ /**********************************************************************
+  *          Wayland text input
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 275a390..60b8017 100755
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -34,6 +34,10 @@ char *process_name = NULL;
+ 
+ static const struct user_driver_funcs waylanddrv_funcs =
+ {
++    .dc_funcs.pCreateDC = WAYLAND_CreateDC,
++    .dc_funcs.pDeleteDC = WAYLAND_DeleteDC,
++    .dc_funcs.pExtEscape = WAYLAND_ExtEscape,
++    .dc_funcs.priority = GDI_PRIORITY_GRAPHICS_DRV,
+     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
+@@ -59,6 +63,11 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pOpenGLInit = WAYLAND_OpenGLInit,
+ };
+ 
++const struct gdi_dc_funcs *get_display_driver_funcs(void)
++{
++    return &waylanddrv_funcs.dc_funcs;
++}
++
+ static void wayland_init_process_name(void)
+ {
+     WCHAR *p, *appname;
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index cf032cb..919195e 100755
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -26,6 +26,7 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <strings.h>
+ #include <assert.h>
+ 
+ #include "windef.h"
+@@ -458,6 +459,66 @@ failed:
+ /**********************************************************************
+  *           ExtEscape  (X11DRV.@)
+  */
++/* Whether the X window under the pointer belongs to Wine rather than to another application
++ * covering our windows, which the window tree of the server knows nothing about. Cached
++ * briefly, applications such as Unreal Engine ask on every frame. */
++static BOOL query_pointer_window( POINT *pos )
++{
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static ULONG last_time;
++    static POINT last_pos;
++    static BOOL last_result;
++    Display *display = thread_init_display();
++    Window root, child, window;
++    int root_x, root_y, x, y, depth;
++    unsigned int state;
++    ULONG now = NtGetTickCount();
++    BOOL ret = FALSE, cached;
++
++    if (!XQueryPointer( display, root_window, &root, &child, &root_x, &root_y, &x, &y, &state ))
++        return TRUE;  /* pointer on another screen, we cannot tell */
++    *pos = root_to_virtual_screen( x, y );
++
++    pthread_mutex_lock( &lock );
++    if ((cached = now - last_time < 50 && pos->x == last_pos.x && pos->y == last_pos.y)) ret = last_result;
++    pthread_mutex_unlock( &lock );
++    if (cached) return ret;
++
++    /* walk down from the top-level window (usually a window manager frame) */
++    for (depth = 0; child && depth < 8; depth++)
++    {
++        XClassHint hint;
++        char *hwnd;
++
++        window = child;
++        if (!XFindContext( display, window, winContext, &hwnd ))
++        {
++            ret = TRUE;
++            break;
++        }
++        if (XGetClassHint( display, window, &hint ))
++        {
++            /* Wine names its windows after the process, also in other processes */
++            size_t len = hint.res_name ? strlen( hint.res_name ) : 0;
++            ret = len > 4 && !strcasecmp( hint.res_name + len - 4, ".exe" );
++            if (hint.res_name) XFree( hint.res_name );
++            if (hint.res_class) XFree( hint.res_class );
++            break;  /* the client window of an application */
++        }
++        if (!XQueryPointer( display, window, &root, &child, &root_x, &root_y, &x, &y, &state )) break;
++    }
++    /* no window under the pointer: either the root window, or under XWayland a Wayland surface */
++
++    TRACE( "pointer at %s over %s window %lx\n", wine_dbgstr_point( pos ), ret ? "a Wine" : "another", child );
++
++    pthread_mutex_lock( &lock );
++    last_time = now;
++    last_pos = *pos;
++    last_result = ret;
++    pthread_mutex_unlock( &lock );
++    return ret;
++}
++
+ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_data,
+                              INT out_count, LPVOID out_data )
+ {
+@@ -505,6 +566,14 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
+                     return TRUE;
+                 }
+                 break;
++            case X11DRV_QUERY_POINTER_WINDOW:
++                if (out_count >= sizeof(struct x11drv_escape_query_pointer_window))
++                {
++                    struct x11drv_escape_query_pointer_window *data = out_data;
++                    data->over_wine = query_pointer_window( &data->pos );
++                    return TRUE;
++                }
++                break;
+             case X11DRV_START_EXPOSURES:
+                 XSetGraphicsExposures( gdi_display, physDev->gc, True );
+                 physDev->exposures = 0;
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index c7be1c5..239500b 100755
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -618,7 +618,9 @@ static void sync_window_region( struct x11drv_win_data *data, HRGN win_region )
+     HRGN hrgn = win_region;
+ 
+     if (!data->whole_window) return;
+-    if (client_side_graphics) return; /* use surface shape instead */
++    /* use the surface shape instead, unless a client window draws directly to the
++     * window: such windows have no surface and would lose their region */
++    if (client_side_graphics && !data->client_window) return;
+     data->shaped = FALSE;
+ 
+     if (hrgn == (HRGN)1)  /* hack: win_region == 1 means retrieve region from server */
+@@ -2314,6 +2316,11 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
+     {
+         client_window_events_disable( data, client_window );
+         XReparentWindow( gdi_display, client_window, get_dummy_parent(), 0, 0 );
++#ifdef HAVE_LIBXSHAPE
++        /* the window surface takes over the shape again */
++        if (client_side_graphics && data->shaped)
++            XShapeCombineMask( data->display, data->whole_window, ShapeBounding, 0, 0, None, ShapeSet );
++#endif
+     }
+ 
+     data->client_window = 0;
+@@ -2339,6 +2346,8 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
+     }
+ 
+     data->client_window = client_window;
++    /* the window draws directly now, apply its region ourselves (see sync_window_region) */
++    if (client_side_graphics && data->whole_window) sync_window_region( data, (HRGN)1 );
+ }
+ 
+ 
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 6bec56d..16a5ad8 100755
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -347,6 +347,14 @@ enum x11drv_escape_codes
+     X11DRV_GET_DRAWABLE,     /* get current drawable for a DC */
+     X11DRV_START_EXPOSURES,  /* start graphics exposures */
+     X11DRV_END_EXPOSURES,    /* end graphics exposures */
++    X11DRV_QUERY_POINTER_WINDOW, /* whether the pointer is over a Wine window */
++};
++
++struct x11drv_escape_query_pointer_window
++{
++    enum x11drv_escape_codes code;         /* escape code (X11DRV_QUERY_POINTER_WINDOW) */
++    POINT                    pos;          /* pointer position, in virtual screen coordinates */
++    BOOL                     over_wine;    /* the X window under the pointer belongs to Wine */
+ };
+ 
+ struct x11drv_escape_set_drawable

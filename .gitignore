@@ -1,0 +1,6 @@
+# what build.sh and make-release.sh download, build and install next to themselves
+wine-source/
+work/
+wine_dist/
+dist/
+__pycache__/

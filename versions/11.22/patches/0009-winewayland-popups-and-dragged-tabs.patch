@@ -1,0 +1,191 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Popups, tooltips and dragged tabs placed with the window that has the pointer.
+
+* winewayland: Keep owned frameless popups unmanaged when activated.
+
+An unmanaged window is a subsurface of its owner, placed where the application puts it. A
+managed one is an xdg_toplevel, which cannot place itself: compositors put it in the centre
+of the screen. Activated windows were managed, and Unreal Engine activates its menus (they
+take the keyboard), so every context menu, drop-down and picker opened in the centre.
+
+Owned popups without a frame (no caption, no thick frame, not WS_EX_APPWINDOW, not
+fullscreen) now stay unmanaged whether activated or not.
+
+* winewayland: Keep unowned popups subsurfaces when they leave our windows.
+
+An unmanaged window without an owner is a subsurface of the window under its top-left corner,
+win32u's owner hint. Unreal Engine moves such a window with the pointer when a tab is dragged
+(its cursor decorator); when its corner left the window it became a toplevel, which the
+compositor places in the centre of the screen, and back a subsurface over the window: it jumped
+around, and the tab could hardly be docked.
+
+When no window of ours is under its corner, such a window keeps the parent it has, or takes the
+foreground window, and Wine keeps placing it.
+
+* winewayland: Unowned popups go with the window that has the pointer.
+
+Applications place unowned popups (tooltips, the cursor decorator of a tab Unreal Engine drags)
+from the pointer position, which Wine computes from the window that has the pointer. The
+position of a toplevel on the screen is the compositor's, so only in that window are the two
+in the same coordinates: as a subsurface of the window under its corner or of the foreground
+window (patch 0015), a decorator dragged out of a floating window was off by the difference,
+jumping down and stopping at the top.
+
+Such a popup is now a subsurface of the window that has the pointer when it is one of ours;
+otherwise as before.
+
+* winewayland: Follow the pointer out of the window while a button is held.
+
+Two things kept a tab Unreal Engine drags out of a floating window from following the pointer.
+
+The pointer position was clamped to the window that has the pointer. Meant for rounding, it also
+caught the pointer while a button is held, when the window keeps getting it far outside: the
+drag stopped at the window's edge. Only a pixel or two outside is clamped now.
+
+The cursor decorator of the drag became a subsurface of a hidden window: Unreal Engine hides the
+window whose last tab is dragged out, a hidden window keeps its surface without a role, and its
+subsurfaces hide with it, so the dragged tab was invisible. Only shown windows are taken as the
+parent of an unowned popup.
+
+* winewayland: Tell a hidden window by its Wayland objects, not its role.
+
+Patch 0020 took a window whose surface has no role for hidden. But a hidden window keeps its
+role and loses only the objects of it (xdg_surface or wl_subsurface): the decorator of a tab
+dragged out as the last of its window still became a subsurface of that hidden window, and was
+invisible. A window is taken as shown when its surface has these objects.
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index c564568..dcde2dc 100755
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -110,6 +110,18 @@ static const struct
+     {riched20_cursors, {'r','i','c','h','e','d','2','0','.','d','l','l',0}}
+ };
+ 
++/* the toplevel of the window that has the pointer, 0 if none of ours */
++HWND wayland_pointer_get_focused_toplevel(void)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    HWND hwnd;
++
++    pthread_mutex_lock(&pointer->mutex);
++    hwnd = pointer->focused_hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++    return hwnd ? NtUserGetAncestor(hwnd, GA_ROOT) : 0;
++}
++
+ static HWND wayland_pointer_get_focused_hwnd(void)
+ {
+     struct wayland_pointer *pointer = &process_wayland.pointer;
+@@ -145,11 +157,14 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+     screen.x += window_rect->left;
+     screen.y += window_rect->top;
+     /* Sometimes, due to rounding, we may end up with pointer coordinates
+-     * slightly outside the target window, so bring them within bounds. */
+-    if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
+-    else if (screen.x < window_rect->left) screen.x = window_rect->left;
+-    if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
+-    else if (screen.y < window_rect->top) screen.y = window_rect->top;
++     * slightly outside the target window, so bring them within bounds.
++     * Only those: while a button is held the window keeps getting the pointer far outside it,
++     * and applications follow it there (a tab Unreal Engine drags out of a floating window
++     * stopped at the window's edge). */
++    if (screen.x >= window_rect->right && screen.x <= window_rect->right + 1) screen.x = window_rect->right - 1;
++    else if (screen.x < window_rect->left && screen.x >= window_rect->left - 2) screen.x = window_rect->left;
++    if (screen.y >= window_rect->bottom && screen.y <= window_rect->bottom + 1) screen.y = window_rect->bottom - 1;
++    else if (screen.y < window_rect->top && screen.y >= window_rect->top - 2) screen.y = window_rect->top;
+ 
+     wayland_win_data_release(data);
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 8ea9d61..7caa23a 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -488,6 +488,7 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
+ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+ void wayland_dnd_window_message(HWND hwnd, WPARAM step);
+ void wayland_keyboard_deactivate(HWND hwnd);
++HWND wayland_pointer_get_focused_toplevel(void);
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 5a769c5..83388a4 100755
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -376,6 +376,14 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+     /* child windows are not managed */
+     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
++    /* Owned popups without a frame (menus, drop-down lists, pickers) stay unmanaged even when
++     * activated: an unmanaged window is a subsurface of its owner, placed where the application
++     * puts it; a toplevel cannot place itself under Wayland, and compositors centre it. Unreal
++     * Engine activates its menus (they take the keyboard) and they all opened in the centre. */
++    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    if ((style & WS_POPUP) && !(style & WS_THICKFRAME) && (style & WS_CAPTION) != WS_CAPTION &&
++        !(ex_style & WS_EX_APPWINDOW) && !fullscreen && NtUserGetWindowRelative(hwnd, GW_OWNER))
++        return FALSE;
+     /* activated windows are managed */
+     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+     if (hwnd == get_active_window()) return TRUE;
+@@ -391,7 +399,6 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+         if (fullscreen) return TRUE;
+     }
+     /* application windows are managed */
+-    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+     if (ex_style & WS_EX_APPWINDOW) return TRUE;
+     /* windows that own popups are managed */
+     if (has_owned_popups(hwnd)) return TRUE;
+@@ -434,7 +441,8 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
+-    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT);
++    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT), foreground = NtUserGetForegroundWindow();
++    HWND pointer_window = wayland_pointer_get_focused_toplevel();
+     struct wayland_surface *owner_surface;
+     struct wayland_win_data *data, *owner_data;
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+@@ -450,6 +458,42 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
+     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
+ 
++    /* An unmanaged window without an owner becomes a subsurface of the window under its top-left
++     * corner (the owner hint). Applications place such windows (tooltips, the cursor decorator of
++     * a tab Unreal Engine drags) from the pointer position, which Wine computes from the window
++     * that has the pointer, and only for it are the two in the same coordinates: the position of
++     * a toplevel on the screen is the compositor's. So it is the parent when the pointer is on one
++     * of our windows; else the parent it has, or the foreground window: as a toplevel it would be
++     * placed by the compositor, in the centre of the screen. */
++    if (!managed && surface && !NtUserGetWindowRelative(hwnd, GW_OWNER) &&
++        (!owner_surface || (pointer_window && pointer_window != hwnd && pointer_window != owner)))
++    {
++        HWND candidates[3] = {pointer_window, 0, foreground ? NtUserGetAncestor(foreground, GA_ROOT) : 0};
++        struct wayland_win_data *candidate_data;
++        unsigned int i;
++
++        if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
++            candidates[1] = data->wayland_surface->owner_hwnd;
++        for (i = 0; i < ARRAY_SIZE(candidates); i++)
++        {
++            if (!candidates[i] || candidates[i] == hwnd) continue;
++            if (!(candidate_data = wayland_win_data_get(candidates[i]))) continue;
++            /* a hidden window keeps its surface, with its role but without the objects of it
++             * (xdg_surface, wl_subsurface), and its subsurfaces hide with it: Unreal Engine hides
++             * the window whose last tab is dragged out */
++            if (candidate_data->wayland_surface &&
++                (candidate_data->wayland_surface->xdg_surface || candidate_data->wayland_surface->wl_subsurface))
++            {
++                if (owner_data) wayland_win_data_release(owner_data);
++                owner_data = candidate_data;
++                owner_surface = candidate_data->wayland_surface;
++                TRACE("hwnd %p is a subsurface of %p\n", hwnd, candidates[i]);
++                break;
++            }
++            wayland_win_data_release(candidate_data);
++        }
++    }
++
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;

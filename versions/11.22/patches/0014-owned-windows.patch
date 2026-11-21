@@ -1,0 +1,176 @@
+From: Wine Fox
+Subject: [PATCH] win32u, winex11, winewayland: Owned windows (Unreal's floating editors) above their owner, on the taskbar, hidden and shown with it.
+
+* win32u, winex11: Owned windows hide and come back with their owner, as on Windows.
+
+Unreal Engine's floating editor windows (owned by the main window, no taskbar button) were lost
+after the desktop's "show desktop" and a restore of the main window, most of all on a second
+monitor:
+- winex11 turned the window manager's iconify of an owned window into SC_MINIMIZE: Windows' shell
+  minimizes taskbar windows only, owned ones hide with their owner (SW_PARENTCLOSING). Minimized
+  on their own they had no taskbar button to come back, and Wine minimized them again when the
+  window manager restored them with the owner. The window manager's iconify of an owned window
+  no longer minimizes it.
+- ShowWindow showed the windows an owner hid when minimized only through DefWindowProc's
+  SC_RESTORE and SC_MAXIMIZE; Windows does it in ShowWindow, whoever restores. Unreal Engine
+  handles SC_RESTORE itself with ShowWindow(SW_RESTORE): its hidden floating windows never came
+  back. show_window now shows them when the owner is shown again from minimized.
+
+* winewayland: The toplevel of a window's owner is its xdg_toplevel parent.
+
+Under Wayland, Unreal Engine's floating editor windows (owned by the main window) were toplevels
+of their own: the main editor window could be raised above them, and the desktop showed them as
+separate windows. On Windows owned windows stay above their owner, and winex11 tells window
+managers so with WM_TRANSIENT_FOR. The toplevel of the owner is now set as the parent of an owned
+window's toplevel (xdg_toplevel.set_parent), each time the window changes and the owner's
+toplevel is another one.
+
+* winex11: Owned windows with WS_EX_APPWINDOW are transient for their group.
+
+Unreal Engine's floating editor windows (Material Editor, Niagara, Message Log) are owned by the
+main window and have WS_EX_APPWINDOW: on Windows each has a taskbar button, grouped under the
+application, and stays above the main window. winex11 made them transient for the owner and of
+the dialog type: KDE Plasma's taskbar hides windows transient for another one, so a floating
+window minimized with its own button could not be brought back, and KWin placed it again over its
+owner (on the first monitor) when it was shown again. Such windows are now normal windows,
+transient for the root window in the owner's group: ICCCM makes them transient for the group, so
+window managers keep them above the owner, and taskbars show them. The window manager's iconify of
+them minimizes them again (0028 kept it from owned windows without a taskbar button only).
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index fa7fce1..f71a581 100755
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5013,6 +5013,13 @@ static BOOL show_window( HWND hwnd, INT cmd )
+         }
+     }
+ 
++    /* As Windows does in ShowWindow: an owner shown again from minimized shows the windows it hid
++     * when minimized, whoever restores it. Applications restoring with ShowWindow themselves,
++     * past DefWindowProc's SC_RESTORE (Unreal Engine), lost them. */
++    if ((style & WS_MINIMIZE) && !(style & WS_CHILD) && cmd != SW_HIDE && cmd != SW_MINIMIZE &&
++        cmd != SW_SHOWMINIMIZED && cmd != SW_SHOWMINNOACTIVE && cmd != SW_FORCEMINIMIZE)
++        NtUserShowOwnedPopups( hwnd, TRUE );
++
+     switch(cmd)
+     {
+     case SW_HIDE:
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index f94a5af..0a3cd1f 100755
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -555,6 +555,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+             }
+             xdg_toplevel_destroy(surface->xdg_toplevel);
+             surface->xdg_toplevel = NULL;
++            surface->xdg_parent = NULL;
+         }
+ 
+         if (surface->xdg_surface)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 5358fb3..4a04a9d 100755
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -307,6 +307,7 @@ struct wayland_surface
+         {
+             struct xdg_surface *xdg_surface;
+             struct xdg_toplevel *xdg_toplevel;
++            struct xdg_toplevel *xdg_parent; /* the toplevel of the owner, as set */
+             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
+             struct zxdg_toplevel_decoration_v1 *xdg_toplevel_decoration;
+             uint32_t xdg_decoration_mode;  /* the mode we asked for, 0 = none yet */
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index c126826..0655539 100755
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -457,6 +457,35 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
+ /***********************************************************************
+  *           WAYLAND_WindowPosChanged
+  */
++/* The toplevel of a window's owner is its parent: the compositor keeps the window above its
++ * owner and minimizes it with it, as Windows does with owned windows (Unreal Engine's floating
++ * editors stay above the main window); window managers get the same from WM_TRANSIENT_FOR
++ * under winex11. */
++static void wayland_win_data_update_parent(struct wayland_win_data *data)
++{
++    struct wayland_surface *surface = data->wayland_surface;
++    struct xdg_toplevel *parent = NULL;
++    struct wayland_win_data *owner_data;
++    HWND owner;
++
++    /* a subsurface's objects share the union with the toplevel's ones */
++    if (!surface || !wayland_surface_is_toplevel(surface)) return;
++    if ((owner = NtUserGetWindowRelative(data->hwnd, GW_OWNER)) &&
++        (owner = NtUserGetAncestor(owner, GA_ROOT)) && owner != data->hwnd &&
++        (owner_data = wayland_win_data_get(owner)))
++    {
++        if (owner_data->wayland_surface && wayland_surface_is_toplevel(owner_data->wayland_surface))
++            parent = owner_data->wayland_surface->xdg_toplevel;
++        wayland_win_data_release(owner_data);
++    }
++    /* shortcut: set again only when the owner's toplevel object changes; an owner that gets its
++     * toplevel after the window does is its parent from the window's next move or show */
++    if (parent == surface->xdg_parent) return;
++    TRACE("hwnd=%p owner=%p parent=%p\n", data->hwnd, owner, parent);
++    xdg_toplevel_set_parent(surface->xdg_toplevel, parent);
++    surface->xdg_parent = parent;
++}
++
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
+@@ -528,6 +557,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     }
+     else if (wayland_win_data_create_wayland_surface(data, owner_surface))
+     {
++        wayland_win_data_update_parent(data);
+         wayland_win_data_update_wayland_state(data);
+     }
+ 
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 6ccfbac..4db0607 100755
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -1144,7 +1144,17 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
+         owner_win = X11DRV_get_whole_window( owner );
+     }
+ 
+-    if (owner_win)
++    /* An owned window with WS_EX_APPWINDOW has a taskbar button of its own on Windows (Unreal
++     * Engine's floating editors) and stays above its owner. Taskbars hide windows transient for
++     * another one (KDE Plasma), and window managers place them over it when shown again (KWin):
++     * such a window is transient for the root window, which ICCCM makes transient for its group,
++     * the owner's, so window managers keep it above the owner and taskbars show it. */
++    if (owner_win && (ex_style & WS_EX_APPWINDOW))
++    {
++        XSetTransientForHint( data->display, data->whole_window, DefaultRootWindow( data->display ) );
++        group_leader = owner_win;
++    }
++    else if (owner_win)
+     {
+         XSetTransientForHint( data->display, data->whole_window, owner_win );
+         group_leader = owner_win;
+@@ -1154,7 +1164,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
+      * only normal windows, and doesn't handle correctly TRANSIENT_FOR hint for
+      * dialogs owned by fullscreen windows.
+      */
+-    if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
++    if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner && !(ex_style & WS_EX_APPWINDOW))
+         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
+     else
+         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
+@@ -1739,7 +1749,13 @@ static UINT window_update_client_state( struct x11drv_win_data *data )
+     }
+     if (!(old_style & WS_MINIMIZE) && (new_style & WS_MINIMIZE))
+     {
+-        if ((old_style & WS_MINIMIZEBOX) && !(old_style & WS_DISABLED))
++        /* Windows' shell minimizes the windows of the taskbar only: owned windows (Unreal Engine's
++         * floating editors) hide with their owner and come back with it. Minimized on their own,
++         * with no taskbar button, they were lost after "show desktop" and a restore of the owner. */
++        if (NtUserGetWindowRelative( data->hwnd, GW_OWNER ) &&
++            !(NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW))
++            TRACE( "not minimizing owned win %p/%lx\n", data->hwnd, data->whole_window );
++        else if ((old_style & WS_MINIMIZEBOX) && !(old_style & WS_DISABLED))
+         {
+             TRACE( "minimizing win %p/%lx\n", data->hwnd, data->whole_window );
+             return SC_MINIMIZE;

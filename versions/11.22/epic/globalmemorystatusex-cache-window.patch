@@ -1,0 +1,65 @@
+diff --git a/dlls/kernelbase/memory.c b/dlls/kernelbase/memory.c
+index 85e596f9d80b73fee6fd53484d44351681cace29..8e368d3d06f32b5fb5e46e382bee3fadf1a67d1f 100644
+--- a/dlls/kernelbase/memory.c
++++ b/dlls/kernelbase/memory.c
+@@ -95,6 +95,34 @@ static void send_cross_process_notification( CROSS_PROCESS_WORK_LIST *list, UINT
+ #endif
+ }
+ 
++long get_globalmemorystatusex_cache_window(void)
++{
++    static long globalmemorystatusex_cache_window = -1;
++
++    if (globalmemorystatusex_cache_window == -1)
++    {
++        char str[64];
++        DWORD n;
++        memset(str, 0, sizeof(str));
++
++        // Default to 1000 ms
++        globalmemorystatusex_cache_window = 1000;
++
++        n = GetEnvironmentVariableA("WINE_GLOBALMEMORYSTATUSEX_CACHE_WINDOW", str, sizeof(str));
++
++        if (0 < n && n < sizeof(str))
++        {
++            long res = strtol(str, NULL, 10);
++
++            if (res != LONG_MIN && res != LONG_MAX)
++            {
++                globalmemorystatusex_cache_window = res;
++            }
++        }
++    }
++    return globalmemorystatusex_cache_window;
++}
++
+ 
+ /***********************************************************************
+  * Virtual memory functions
+@@ -1409,12 +1437,20 @@ BOOL WINAPI DECLSPEC_HOTPATCH GlobalMemoryStatusEx( MEMORYSTATUSEX *status )
+         SetLastError( ERROR_INVALID_PARAMETER );
+         return FALSE;
+     }
+-    RtlEnterCriticalSection(&memstatus_section);
+-    if ((GetTickCount64() - last_check) < 1000 && cached_status.dwLength > 0)
++    /* Don't bother checking the time since our last update if the cache window is 0.
++       This ensures that a cache window of '0' is guaranteed to disable the cache completely.
++       On Windows, the resolution of the GetTickCount function is limited to the resolution
++       of the system timer, which is typically in the range of 10 milliseconds to 16 milliseconds.
++    */
++    if (get_globalmemorystatusex_cache_window() > 0)
+     {
+-	*status = cached_status;
+-	RtlLeaveCriticalSection(&memstatus_section);
+-	return TRUE;
++        RtlEnterCriticalSection(&memstatus_section);
++        if ((GetTickCount64() - last_check) < get_globalmemorystatusex_cache_window() && cached_status.dwLength > 0)
++        {
++            *status = cached_status;
++            RtlLeaveCriticalSection(&memstatus_section);
++            return TRUE;
++        }
+     }
+ 
+     if (!set_ntstatus( NtQuerySystemInformation( SystemBasicInformation,
