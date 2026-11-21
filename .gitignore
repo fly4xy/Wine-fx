@@ -4,3 +4,6 @@ work/
 wine_dist/
 dist/
 __pycache__/
+# what Unreal builds in the plugin: only its sources go in
+unreal/*/Binaries/
+unreal/*/Intermediate/

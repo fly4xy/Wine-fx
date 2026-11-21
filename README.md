@@ -120,6 +120,16 @@ dragging files in, `.bat` scripts, the Epic Games Launcher's start). [Wine Fox](
 carries them and installs them into prefixes (Tools, Patches). The new Epic Games Launcher
 needs that fix in its prefix as well as 0016 here.
 
+## Unreal Editor plugin
+
+[`unreal/WineFoxVSCode`](unreal/WineFoxVSCode) adds *Tools → Open in VS Code (Linux)* to Unreal Editor running in Wine.
+In a Blueprint editor it opens the Blueprint's C++ parent class (its `.h` and `.cpp`); anywhere
+else, such as the level viewport, the project's Linux workspace (`<Project>.linux.code-workspace`).
+
+Copy the folder into the project's `Plugins/` (or the engine's `Engine/Plugins/`) and build the
+editor once. VS Code runs on the Linux side: the one Wine Fox finds (`code`, `codium` or the
+Flatpak) when it starts the editor, else `code` from `PATH`; `WINEFOX_CODE` overrides it.
+
 ## Releases (maintainers)
 
 ```bash

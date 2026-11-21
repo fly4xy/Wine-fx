@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "2.0",
+	"FriendlyName": "VS Code on Linux (Wine Fox)",
+	"Description": "Tools > Open in VS Code (Linux): in a Blueprint editor its C++ parent class, elsewhere the project's Linux workspace. For Unreal Editor running in Wine.",
+	"Category": "Programming",
+	"CreatedBy": "Wine Fox",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "WineFoxVSCode",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [ "Win64" ]
+		}
+	]
+}

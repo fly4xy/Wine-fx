@@ -120,6 +120,16 @@ bash build.sh
 Их несёт [Wine Fox](https://lis-carter.site/wine-fox/) и ставит в префиксы («Инструменты»,
 «Патчи»). Новому Epic Games Launcher нужно и это исправление в его префиксе, и 0016 отсюда.
 
+## Плагин Unreal Editor
+
+[`unreal/WineFoxVSCode`](unreal/WineFoxVSCode) добавляет в Unreal Editor под Wine пункт *Tools → Open in VS Code (Linux)*.
+В редакторе блупринта он открывает C++-родителя блупринта (его `.h` и `.cpp`), в остальных
+местах, например во вьюпорте, — линуксовый workspace проекта (`<Project>.linux.code-workspace`).
+
+Скопируйте папку в `Plugins/` проекта (или в `Engine/Plugins/` движка) и один раз соберите
+редактор. VS Code запускается на стороне Linux: тот, что Wine Fox находит (`code`, `codium` или
+Flatpak) при запуске редактора, иначе `code` из `PATH`; `WINEFOX_CODE` его заменяет.
+
 ## Релизы (для сопровождающих)
 
 ```bash
