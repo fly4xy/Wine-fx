@@ -282,8 +282,11 @@ build()
     # building Wine without a display driver
     # --libdir: wine looks for its libraries in bin/../lib, whatever a config.site of the system
     # says; no -g: debugging information would triple the size of the build
+    # -ffile-prefix-map: no work/ paths in the modules (__FILE__ names critical sections), so that
+    # a module the patches do not touch is the same in every build and stays out of a release
+    local map="-ffile-prefix-map=$SRC/=wine/ -ffile-prefix-map=$BUILD/=wine/"
     local config=(--prefix="$PREFIX" --libdir="$PREFIX/lib" --enable-archs=i386,x86_64 --disable-tests
-                  --with-x --with-wayland CFLAGS="-O2" CROSSCFLAGS="-O2")
+                  --with-x --with-wayland CFLAGS="-O2 $map" CROSSCFLAGS="-O2 $map")
     # a different set of patches (or sources, or configure options) starts over: files a dropped
     # patch had changed come back with their old dates, and make would keep objects built from it
     local id
@@ -299,6 +302,8 @@ build()
         # what configure left out for want of a library
         grep -E "^configure: (WARNING|OpenCL|.*won't be supported)" "$WORK/configure.log" | sed 's/^configure: /    /' || true
     fi
+    # the Windows modules' PE timestamp: the date of Wine's sources, not now (same reason as above)
+    export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(stat -c %Y "$PRISTINE/configure")}
     say "compiling, $JOBS at a time (the log: $WORK/make.log)"
     make_with_progress "$WORK/make.log" -C "$BUILD" -j"$JOBS" \
         || { grep -E -B3 " error:|\*\*\*" "$WORK/make.log" | head -40; die "the build failed"; }
