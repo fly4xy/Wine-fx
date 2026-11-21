@@ -33,6 +33,25 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# started from the file manager (no terminal, no arguments): run again in a terminal window,
+# which stays open at the end so that the result can be read
+if [ $# -eq 0 ] && ! [ -t 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    run="bash \"$HERE/build.sh\"; echo; read -rp 'Press Enter to close this window. '"
+    for t in konsole gnome-terminal kgx xfce4-terminal mate-terminal kitty alacritty foot \
+             x-terminal-emulator xterm; do
+        command -v "$t" > /dev/null || continue
+        case $t in
+            gnome-terminal|kgx) exec "$t" -- bash -c "$run" ;;
+            xfce4-terminal|mate-terminal) exec "$t" -x bash -c "$run" ;;
+            kitty|foot) exec "$t" bash -c "$run" ;;
+            *) exec "$t" -e bash -c "$run" ;;
+        esac
+    done
+    command -v notify-send > /dev/null && notify-send "Wine-Fx" "No terminal found: run bash build.sh in one"
+    exit 1
+fi
+
 VERSION="" PREFIX="" SOURCE="" YES="" DEPS=1 CLEAN="" SKIP="" ONLY="" CHOICE="" VANILLA=""
 # the processor's threads but two, so that the computer stays usable while it builds
 THREADS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
