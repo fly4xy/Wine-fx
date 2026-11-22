@@ -7,6 +7,7 @@
 #   Wine-Fx-<version>-<fx>.tar.xz  the files the patches change or add, with manifest.json
 #                                  (fx: FX_RELEASE of versions/<version>/wine.conf)
 #   releases.json                  every release in dist/, for the installers
+#   wine-fx-install.py             the installer, to attach to the release as well
 #
 # The base is not ours: a ready Wine of that version as released (BASE_URL of wine.conf,
 # Kron4ek's build), downloaded by the installers; the release's files go over it. To know which
@@ -102,5 +103,7 @@ data["releases"].append({"release": name, "wine": wine, "fx": letter, "date": ti
                                   "size": int(base_size), "sha256": base_sha}, "overlay": part(f"{name}.tar.xz"), "patches": subjects})
 path.write_text(json.dumps(data, indent=1) + "\n")
 EOF
+# the installer goes with the release: it is what people download to install it
+install -m 755 "$HERE/wine-fx-install.py" "$DIST/"
 ls -la "$DIST"
-echo "upload $NAME.tar.xz and releases.json to the GitHub release $VERSION-$FX"
+echo "upload $NAME.tar.xz, releases.json and wine-fx-install.py to the GitHub release $VERSION-$FX"
