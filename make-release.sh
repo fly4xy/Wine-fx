@@ -19,7 +19,9 @@
 # (fx: FX_RELEASE of versions/<version>/wine.conf.) To know which files the patches change, Wine
 # is built without them, then they are applied to the same tree and only what they touch is
 # built again. Build it on an old distribution (an Ubuntu 22.04 chroot, glibc 2.35): the Unix
-# modules of the release then run on the systems the base runs on. --pack-only packs again
+# modules of the release then run on the systems the base runs on. It needs the Wayland headers
+# of 1.21 or later (1.24 from source in /usr/local): with older ones winewayland is built
+# without the axis_value120 handler and crashes on the first scroll. --pack-only packs again
 # from the builds already made (work/<version>-release).
 # Attach everything in dist/ to the GitHub release of the tag <version>-<fx>. Raise FX_RELEASE in
 # wine.conf before releasing changed patches.
