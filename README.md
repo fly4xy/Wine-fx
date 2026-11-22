@@ -7,17 +7,23 @@ Wayland): Epic Games' patches for Unreal Engine and Wine-Fx's own. This reposito
 the patches and the scripts, no Wine sources. [Wine Fox](https://lis-carter.site/wine-fox/)
 installs and updates Wine-Fx by itself (Wine & components).
 
-There are two ways to get it:
+There are two ways to get it; each [release](https://github.com/fly4xy/Wine-fx/releases) has an
+archive for each:
 
-| | What it does | For |
-|---|---|---|
-| **Build** (`build.sh`) | downloads the Wine sources, installs the build dependencies, applies all the patches or the ones you choose, builds Wine | choosing patches, your own changes, a Wine version with no release yet |
-| **Install** (`wine-fx-install.py`) | downloads a ready Wine of the version and puts the release's files into it | everyone else: minutes instead of an hour, nothing to build |
+| | Archive | What its script does | For |
+|---|---|---|---|
+| **Build** | `Wine-Fx-<version>-<letter>-build.tar.gz` (`build.sh`) | asks the Wine version, downloads its sources, installs the build dependencies, applies all the patches or the ones you choose, builds Wine | choosing patches, your own changes |
+| **Install** | `Wine-Fx-<version>-<letter>.tar.xz` (`wine-fx-install.py`) | asks the Wine version, downloads a ready Wine of that version and puts the release's files into it | everyone else: minutes instead of an hour, nothing to build |
+
+Unpack the archive and start its script: from a terminal, or with a double click (it opens a
+terminal by itself).
 
 Versions are `<Wine version>-<letter>`: `11.22-a`, then `11.22-b` with the next change of the
 patches for Wine 11.22.
 
 ## Install (ready files)
+
+Unpack `Wine-Fx-<version>-<letter>.tar.xz` from the release, then:
 
 ```bash
 python3 wine-fx-install.py
@@ -25,9 +31,8 @@ python3 wine-fx-install.py
 
 It asks which Wine version (Enter: the newest) and where (Enter: `~/.local/share/wine-fx/Wine-Fx-<version>`).
 The first time it downloads a ready Wine of that version as released, [Kron4ek's build](https://github.com/Kron4ek/Wine-Builds)
-(`wine-<version>-amd64-wow64`), then the release's files from this repository's
-[releases](https://github.com/fly4xy/Wine-fx/releases) (`Wine-Fx-<version>-<letter>`, a few
-megabytes). Both are checked against their SHA-256. An update downloads only the release's files.
+(`wine-<version>-amd64-wow64`), then puts in the release's files from the archive (`files/`, a few megabytes); for another
+Wine version it downloads that version's release. All is checked against its SHA-256. An update downloads only the release's files.
 
 The release's Unix modules need glibc 2.35 or later (Ubuntu 22.04, Debian 12, Fedora 36 and newer).
 
@@ -50,7 +55,8 @@ is (a URL or a path).
 bash build.sh
 ```
 
-The script:
+(`Wine-Fx-<version>-<letter>-build.tar.gz` of a release, unpacked, or a clone of this
+repository.) The script:
 
 1. asks which Wine version to build, when there are several in `versions/` (Enter: the newest);
 2. installs the build dependencies, after asking (Debian/Ubuntu, Fedora, Arch, openSUSE; on

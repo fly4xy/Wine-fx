@@ -3,6 +3,10 @@
 
     python3 wine-fx-install.py [--list] [--release NAME] [--dest DIR] [--undo DIR] [--yes]
 
+In an unpacked release archive (Wine-Fx-<version>-<letter>.tar.xz: this script, manifest.json,
+files/) it installs that release from those files and downloads only the base. On its own it
+reads the list of releases from GitHub and downloads both.
+
 A release of Wine-Fx (releases.json lists them) is two archives:
 - the base: a ready Wine <version> as released (Kron4ek's build, from its own GitHub
   releases), not made by Wine-Fx;
@@ -26,6 +30,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -33,6 +38,7 @@ import urllib.request
 from pathlib import Path
 
 RELEASES = os.environ.get("WINEFX_RELEASES", "https://github.com/fly4xy/Wine-fx/releases/latest/download/releases.json")
+HERE = Path(__file__).resolve().parent
 STATE = "share/wine-fx/overlay.json"
 ORIG = ".wfx-orig"
 
@@ -145,8 +151,9 @@ def apply(dest: Path, overlay: Path) -> dict:
     return state
 
 
-def install(release: dict, dest: Path, progress=None, log=print) -> dict:
-    """Install a release into dest: the base first if dest has no Wine of that version."""
+def install(release: dict, dest: Path, progress=None, log=print, overlay: Path | None = None) -> dict:
+    """Install a release into dest: the base first if dest has no Wine of that version. overlay:
+    the release already unpacked (the archive this script came in), else it is downloaded."""
     have = installed(dest)
     with tempfile.TemporaryDirectory(prefix="wine-fx-", dir=dest.parent if dest.parent.is_dir() else None) as tmp:
         tmp = Path(tmp)
@@ -159,9 +166,37 @@ def install(release: dict, dest: Path, progress=None, log=print) -> dict:
             if dest.exists():
                 dest.rmdir()
             shutil.move(str(base), dest)
-        log(f"downloading {release['overlay']['file']}")
-        overlay = _extract(download(release["overlay"], tmp, progress), tmp / "overlay")
+        if overlay is None:
+            log(f"downloading {release['overlay']['file']}")
+            overlay = _extract(download(release["overlay"], tmp, progress), tmp / "overlay")
         return apply(dest, overlay)
+
+
+def local_release() -> dict | None:
+    """The release of the archive this script is in (manifest.json and files/ next to it)."""
+    try:
+        m = json.loads((HERE / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return m if (HERE / "files").is_dir() and "base" in m else None
+
+
+TERMINALS = (("konsole", "-e"), ("gnome-terminal", "--"), ("kgx", "--"), ("xfce4-terminal", "-x"),
+             ("mate-terminal", "-x"), ("kitty", None), ("alacritty", "-e"), ("foot", None),
+             ("x-terminal-emulator", "-e"), ("xterm", "-e"))
+
+
+def in_terminal() -> None:
+    """Started from the file manager (no terminal, no arguments): run again in a terminal window,
+    which stays open at the end."""
+    if len(sys.argv) > 1 or sys.stdin.isatty() or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return
+    run = f'"{sys.executable}" "{Path(__file__).resolve()}"; echo; read -rp "Press Enter to close this window. "'
+    for name, flag in TERMINALS:
+        if shutil.which(name):
+            os.execvp(name, [name, *([flag] if flag else []), "bash", "-c", run])
+    subprocess.run(["notify-send", "Wine-Fx", "No terminal found: run python3 wine-fx-install.py in one"], check=False)
+    sys.exit(1)
 
 
 def main() -> int:
@@ -172,11 +207,20 @@ def main() -> int:
     ap.add_argument("--undo", metavar="DIR", help="put back the files the installed release replaced")
     ap.add_argument("--yes", action="store_true", help="do not ask: the newest release, the default folder")
     a = ap.parse_args()
+    in_terminal()
     try:
         if a.undo:
             print(f"{len(undo(Path(a.undo).expanduser()))} file(s) put back")
             return 0
-        items = releases()
+        local = None if (a.list or a.release) else local_release()
+        try:
+            items = releases()
+        except (OSError, ValueError, KeyError):
+            if not local:
+                raise
+            items = []   # offline: this archive's release only
+        if local:   # this archive's release first; its files are here
+            items = [local] + [r for r in items if r["release"] != local["release"]]
         if a.list:
             for r in items:
                 print(f"{r['release']}  (Wine {r['wine']})")
@@ -189,8 +233,11 @@ def main() -> int:
             release = items[0]
         else:   # the Wine version, with the newest release of the patches for it
             newest = list({r["wine"]: r for r in reversed(items)}.values())[::-1]
+            if local:   # this archive's Wine first, whatever its version
+                newest.sort(key=lambda r: r is not local)
             for i, r in enumerate(newest, 1):
-                print(f"  {i}) Wine {r['wine']}  ({r['release']})")
+                here = ", files in this archive" if r is local else ""
+                print(f"  {i}) Wine {r['wine']}  ({r['release']}{here})")
             answer = input("Which Wine? [1] ").strip() or "1"
             release = newest[int(answer) - 1]
         default = Path.home() / ".local/share/wine-fx" / f"Wine-Fx-{release['wine']}"
@@ -202,7 +249,8 @@ def main() -> int:
 
         def progress(done, total):
             print(f"\r    {done * 100 // total if total else 0}%", end="", flush=True)
-        state = install(release, dest.resolve(), progress, log=lambda m: print(f"\n>>> {m}"))
+        state = install(release, dest.resolve(), progress, log=lambda m: print(f"\n>>> {m}"),
+                        overlay=HERE if release is local else None)
         print(f"\ndone: {dest}/bin/wine, {state['release']} ({len(state['files'])} file(s) of the release)")
         return 0
     except (FxError, OSError, ValueError, KeyError) as e:
