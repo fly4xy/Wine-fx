@@ -23,10 +23,13 @@ patches for Wine 11.22.
 python3 wine-fx-install.py
 ```
 
-It asks which release (Enter: the newest) and where (Enter: `~/.local/share/wine-fx/Wine-Fx-<version>`).
-The first time it downloads Wine of that version as released (`Wine-<version>-base`, built by
-this repository's `build.sh --vanilla`), then the release's files (`Wine-Fx-<version>-<letter>`,
-a few megabytes). Both are checked against their SHA-256.
+It asks which Wine version (Enter: the newest) and where (Enter: `~/.local/share/wine-fx/Wine-Fx-<version>`).
+The first time it downloads a ready Wine of that version as released, [Kron4ek's build](https://github.com/Kron4ek/Wine-Builds)
+(`wine-<version>-amd64-wow64`), then the release's files from this repository's
+[releases](https://github.com/fly4xy/Wine-fx/releases) (`Wine-Fx-<version>-<letter>`, a few
+megabytes). Both are checked against their SHA-256. An update downloads only the release's files.
+
+The release's Unix modules need glibc 2.35 or later (Ubuntu 22.04, Debian 12, Fedora 36 and newer).
 
 The files a release replaces stay next to them as `<file>.wfx-orig`, and
 `share/wine-fx/overlay.json` lists them. Installing another release of the same Wine (an
@@ -35,7 +38,7 @@ update) puts them back first, then puts the new files in. Other options:
 ```bash
 python3 wine-fx-install.py --list                       # the releases
 python3 wine-fx-install.py --release Wine-Fx-11.22-a    # that one, still asks where
-python3 wine-fx-install.py --undo ~/.local/share/wine-fx/Wine-Fx-11.22   # Wine as released again
+python3 wine-fx-install.py --undo ~/.local/share/wine-fx/Wine-Fx-11.22   # Kron4ek's Wine as it was
 ```
 
 Only Python 3 (standard library) is needed. `WINEFX_RELEASES` sets where `releases.json`
@@ -136,14 +139,16 @@ Flatpak) when it starts the editor, else `code` from `PATH`; `WINEFOX_CODE` over
 bash make-release.sh 11.22
 ```
 
-It builds Wine 11.22 as released once (`--vanilla`, kept in `dist/Wine-11.22-base.tar.xz`),
-builds it with all the patches, packs the files that differ into `dist/Wine-Fx-11.22-<letter>.tar.xz`
-with `manifest.json`, and updates `dist/releases.json`. Upload the new archives, then
-`releases.json`. Raise `FX_RELEASE` in `versions/11.22/wine.conf` before releasing changed
-patches, and tag the commit `11.22-<letter>`.
+It builds Wine 11.22 without the patches, then applies them to the same tree, so that only
+what they touch is built again; the files that differ go into `dist/Wine-Fx-11.22-<letter>.tar.xz`
+with `manifest.json`, and `dist/releases.json` lists the release with its base (`BASE_URL` of
+`wine.conf`: Kron4ek's build, not uploaded here). Build it on an old distribution, e.g. in an
+Ubuntu 22.04 chroot, so that the Unix modules run where the base runs. Raise `FX_RELEASE` in
+`versions/11.22/wine.conf` before releasing changed patches, tag the commit `11.22-<letter>`, and
+attach the archive and `releases.json` to the GitHub release of that tag.
 
 A new Wine version: copy `versions/<version>` to a folder for it, set `WINE_VERSION`,
-`WINE_URL`, `WINE_SHA256` and `FX_RELEASE=a` in its `wine.conf`, and check that the patches
+`WINE_URL`, `WINE_SHA256`, `BASE_URL`, `BASE_SIZE`, `BASE_SHA256` and `FX_RELEASE=a` in its `wine.conf`, and check that the patches
 apply: `bash build.sh <version> --all`.
 
 ## Licences

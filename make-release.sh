@@ -1,17 +1,21 @@
 #!/bin/bash
-# Makes the file releases of Wine-Fx (what wine-fx-install.py and Wine Fox install), into dist/:
+# Makes the file release of Wine-Fx for one Wine version (what wine-fx-install.py and Wine Fox
+# install), into dist/:
 #
 #   bash make-release.sh [version] [--jobs N]
 #
-#   Wine-<version>-base.tar.xz     Wine as released, built by build.sh --vanilla: made once per
-#                                  Wine version (kept in dist/ and reused)
 #   Wine-Fx-<version>-<fx>.tar.xz  the files the patches change or add, with manifest.json
 #                                  (fx: FX_RELEASE of versions/<version>/wine.conf)
 #   releases.json                  every release in dist/, for the installers
 #
-# Upload the new files of dist/ to the server ($RELEASES_BASE) with releases.json last. Both
-# builds are made here, with the same compilers and options: the release's files fit the base
-# exactly. Raise FX_RELEASE in wine.conf before releasing changed patches.
+# The base is not ours: a ready Wine of that version as released (BASE_URL of wine.conf,
+# Kron4ek's build), downloaded by the installers; the release's files go over it. To know which
+# files the patches change, Wine is built without them, then they are applied to the same tree
+# and only what they touch is built again.
+# Build it on an old distribution (an Ubuntu 22.04 chroot, glibc 2.35): the Unix modules of the
+# release then also run on the systems the base runs on.
+# Upload the archive to the GitHub release of the tag <version>-<fx>, with releases.json. Raise
+# FX_RELEASE in wine.conf before releasing changed patches.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 VERSION="" JOBS=()
@@ -25,28 +29,27 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$VERSION" ] || VERSION=$(ls "$HERE/versions" | sort -V | tail -1)
 . "$HERE/versions/$VERSION/wine.conf"
+[ -n "${BASE_URL:-}" ] || { echo "error: no BASE_URL in versions/$VERSION/wine.conf" >&2; exit 1; }
 FX=${FX_RELEASE:-a}
-RELEASES_BASE=${RELEASES_BASE:-https://downloads.lis-carter.site/wine-fx}
 DIST=$HERE/dist
-BASE=Wine-$WINE_VERSION-base
 NAME=Wine-Fx-$VERSION-$FX
+WORK=$HERE/work/$VERSION-release      # one tree for both builds
+PREFIX=$WORK/install                  # the same prefix for both: nothing differs by its path
 mkdir -p "$DIST"
+export WORK
 
-if [ ! -f "$DIST/$BASE.tar.xz" ]; then
-    echo ">>> $BASE: Wine $WINE_VERSION as released"
-    WORK=$HERE/work/$VERSION-vanilla bash "$HERE/build.sh" "$VERSION" --vanilla --yes --no-deps \
-        --prefix "$HERE/wine_dist/$BASE" "${JOBS[@]}"
-    tar -C "$HERE/wine_dist" -cJf "$DIST/$BASE.tar.xz" "$BASE"
-fi
-[ -d "$HERE/wine_dist/$BASE" ] || tar -C "$HERE/wine_dist" -xJf "$DIST/$BASE.tar.xz"
+echo ">>> Wine $WINE_VERSION without the patches"
+bash "$HERE/build.sh" "$VERSION" --vanilla --yes --no-deps --prefix "$PREFIX" "${JOBS[@]}"
+rm -rf "$WORK/vanilla"
+cp -a "$PREFIX" "$WORK/vanilla"
 
-echo ">>> $NAME: with all the patches"
-bash "$HERE/build.sh" "$VERSION" --all --yes --no-deps --prefix "$HERE/wine_dist/Wine-Fx-$VERSION" "${JOBS[@]}"
+echo ">>> $NAME: the patches over the same tree"
+bash "$HERE/build.sh" "$VERSION" --all --yes --no-deps --keep-build --prefix "$PREFIX" "${JOBS[@]}"
 
 echo ">>> $NAME.tar.xz: what differs from the base"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-python3 - "$HERE/wine_dist/$BASE" "$HERE/wine_dist/Wine-Fx-$VERSION" "$STAGE/$NAME" "$NAME" "$WINE_VERSION" "$FX" <<'EOF'
+python3 - "$WORK/vanilla" "$PREFIX" "$STAGE/$NAME" "$NAME" "$WINE_VERSION" "$FX" <<'EOF'
 import hashlib, json, os, shutil, sys
 from pathlib import Path
 base, fx, out, name, wine, letter = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), *sys.argv[4:]
@@ -79,10 +82,11 @@ EOF
 tar -C "$STAGE" -cJf "$DIST/$NAME.tar.xz" "$NAME"
 
 echo ">>> releases.json"
-python3 - "$DIST" "$NAME" "$BASE" "$WINE_VERSION" "$FX" "$HERE/versions/$VERSION/patches" <<'EOF'
+python3 - "$DIST" "$NAME" "$WINE_VERSION" "$FX" "$HERE/versions/$VERSION/patches" "$BASE_URL" "$BASE_SIZE" "$BASE_SHA256" <<'EOF'
 import hashlib, json, re, sys, time
 from pathlib import Path
-dist, name, base, wine, letter, patches = Path(sys.argv[1]), *sys.argv[2:6], Path(sys.argv[6])
+dist, name, wine, letter, patches = Path(sys.argv[1]), *sys.argv[2:5], Path(sys.argv[5])
+base_url, base_size, base_sha = sys.argv[6:9]
 def part(f):
     p = dist / f
     return {"file": f, "size": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
@@ -94,8 +98,9 @@ path = dist / "releases.json"
 data = json.loads(path.read_text()) if path.exists() else {"releases": []}
 data["releases"] = [r for r in data["releases"] if r["release"] != name]
 data["releases"].append({"release": name, "wine": wine, "fx": letter, "date": time.strftime("%Y-%m-%d"),
-                         "base": part(f"{base}.tar.xz"), "overlay": part(f"{name}.tar.xz"), "patches": subjects})
+                         "base": {"file": base_url.rsplit("/", 1)[1], "url": base_url,
+                                  "size": int(base_size), "sha256": base_sha}, "overlay": part(f"{name}.tar.xz"), "patches": subjects})
 path.write_text(json.dumps(data, indent=1) + "\n")
 EOF
 ls -la "$DIST"
-echo "upload to $RELEASES_BASE: $NAME.tar.xz (and $BASE.tar.xz if it is not there yet), then releases.json"
+echo "upload $NAME.tar.xz and releases.json to the GitHub release $VERSION-$FX"

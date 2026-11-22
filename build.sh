@@ -20,6 +20,8 @@
 #   --yes           do not ask: keep sources already downloaded, install the dependencies
 #   --no-deps       do not install the build dependencies
 #   --clean         start the build from scratch
+#   --keep-build    keep the build tree when the set of patches changes, so that only what the
+#                   new patches touch is built again (make-release.sh: from none to all)
 #   --skip LIST     leave out Wine-Fx's patches by number, e.g. --skip 0006,0009 (to find the one
 #                   that broke something)
 #
@@ -52,7 +54,7 @@ if [ $# -eq 0 ] && ! [ -t 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     exit 1
 fi
 
-VERSION="" PREFIX="" SOURCE="" YES="" DEPS=1 CLEAN="" SKIP="" ONLY="" CHOICE="" VANILLA=""
+VERSION="" PREFIX="" SOURCE="" YES="" DEPS=1 CLEAN="" KEEP="" SKIP="" ONLY="" CHOICE="" VANILLA=""
 # the processor's threads but two, so that the computer stays usable while it builds
 THREADS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
 JOBS=$(( THREADS > 3 ? THREADS - 2 : 1 ))
@@ -68,6 +70,7 @@ while [ $# -gt 0 ]; do
         --yes|-y) YES=1 ;;
         --no-deps) DEPS="" ;;
         --clean) CLEAN=1 ;;
+        --keep-build) KEEP=1 ;;
         --skip) SKIP=$2; shift ;;
         --patches) ONLY=$2; shift ;;
         --all) CHOICE=all ;;
@@ -311,7 +314,9 @@ build()
     local id
     id=$(cat $(patch_list) 2>/dev/null \
          | cat - <(echo "${config[*]}") <(ls -l --time-style=+%s "$PRISTINE") | sha1sum | cut -c1-12)
-    if [ -n "$CLEAN" ] || [ "$(cat "$BUILD/.wine-fx-id" 2>/dev/null)" != "$id" ]; then rm -rf "$BUILD"; fi
+    if [ -n "$CLEAN" ] || { [ -z "$KEEP" ] && [ "$(cat "$BUILD/.wine-fx-id" 2>/dev/null)" != "$id" ]; }; then
+        rm -rf "$BUILD"
+    fi
     mkdir -p "$BUILD"
     echo "$id" > "$BUILD/.wine-fx-id"
     if [ ! -f "$BUILD/Makefile" ] || [ "$SRC/configure" -nt "$BUILD/Makefile" ]; then

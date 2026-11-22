@@ -23,10 +23,14 @@ Wayland): патчи Epic Games для Unreal Engine и собственные �
 python3 wine-fx-install.py
 ```
 
-Скрипт спрашивает, какой релиз (Enter — самый новый) и куда (Enter —
-`~/.local/share/wine-fx/Wine-Fx-<версия>`). В первый раз он скачивает Wine этой версии как он
-вышел (`Wine-<версия>-base`, собран `build.sh --vanilla` из этого репозитория), затем файлы
-релиза (`Wine-Fx-<версия>-<буква>`, несколько мегабайт). Всё сверяется по SHA-256.
+Скрипт спрашивает, какая версия Wine (Enter — самая новая) и куда (Enter —
+`~/.local/share/wine-fx/Wine-Fx-<версия>`). В первый раз он скачивает готовый Wine этой версии как
+он вышел — [сборку Kron4ek](https://github.com/Kron4ek/Wine-Builds) (`wine-<версия>-amd64-wow64`),
+затем файлы релиза из [релизов](https://github.com/fly4xy/Wine-fx/releases) этого репозитория
+(`Wine-Fx-<версия>-<буква>`, несколько мегабайт). Всё сверяется по SHA-256. Обновление скачивает
+только файлы релиза.
+
+Unix-модулям релиза нужна glibc 2.35 или новее (Ubuntu 22.04, Debian 12, Fedora 36 и новее).
 
 Файлы, которые релиз заменяет, остаются рядом как `<файл>.wfx-orig`, а их список — в
 `share/wine-fx/overlay.json`. При установке другого релиза того же Wine (обновлении) сначала
@@ -35,7 +39,7 @@ python3 wine-fx-install.py
 ```bash
 python3 wine-fx-install.py --list                       # релизы
 python3 wine-fx-install.py --release Wine-Fx-11.22-a    # этот релиз, место всё равно спросит
-python3 wine-fx-install.py --undo ~/.local/share/wine-fx/Wine-Fx-11.22   # снова Wine как он вышел
+python3 wine-fx-install.py --undo ~/.local/share/wine-fx/Wine-Fx-11.22   # снова Wine Kron4ek как был
 ```
 
 Нужен только Python 3 (стандартная библиотека). `WINEFX_RELEASES` задаёт, где лежит
@@ -136,14 +140,16 @@ Flatpak) при запуске редактора, иначе `code` из `PATH`
 bash make-release.sh 11.22
 ```
 
-Скрипт один раз собирает Wine 11.22 как он вышел (`--vanilla`, хранится в
-`dist/Wine-11.22-base.tar.xz`), собирает его со всеми патчами, упаковывает отличающиеся файлы в
-`dist/Wine-Fx-11.22-<буква>.tar.xz` с `manifest.json` и обновляет `dist/releases.json`. Выложите
-новые архивы, потом `releases.json`. Перед релизом изменённых патчей поднимите `FX_RELEASE` в
-`versions/11.22/wine.conf` и поставьте на коммит тег `11.22-<буква>`.
+Скрипт собирает Wine 11.22 без патчей, затем накладывает их на то же дерево, и пересобирается
+только то, что они затрагивают; отличающиеся файлы идут в `dist/Wine-Fx-11.22-<буква>.tar.xz` с
+`manifest.json`, а `dist/releases.json` описывает релиз вместе с основой (`BASE_URL` из
+`wine.conf`: сборка Kron4ek, сюда не выкладывается). Собирайте на старом дистрибутиве, например в
+chroot Ubuntu 22.04, чтобы Unix-модули работали там же, где основа. Перед релизом изменённых
+патчей поднимите `FX_RELEASE` в `versions/11.22/wine.conf`, поставьте на коммит тег
+`11.22-<буква>` и приложите архив и `releases.json` к релизу этого тега на GitHub.
 
 Новая версия Wine: скопируйте `versions/<версия>` в папку для неё, задайте в её `wine.conf`
-`WINE_VERSION`, `WINE_URL`, `WINE_SHA256` и `FX_RELEASE=a` и проверьте, что патчи накладываются:
+`WINE_VERSION`, `WINE_URL`, `WINE_SHA256`, `BASE_URL`, `BASE_SIZE`, `BASE_SHA256` и `FX_RELEASE=a` и проверьте, что патчи накладываются:
 `bash build.sh <версия> --all`.
 
 ## Лицензии

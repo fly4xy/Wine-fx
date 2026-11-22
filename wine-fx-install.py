@@ -3,13 +3,13 @@
 
     python3 wine-fx-install.py [--list] [--release NAME] [--dest DIR] [--undo DIR] [--yes]
 
-Wine-Fx releases two kinds of archives (releases.json lists them):
-- Wine-<version>-base.tar.xz: Wine <version> as released, built by build.sh --vanilla. Once
-  per Wine version.
+A release of Wine-Fx (releases.json lists them) is two archives:
+- the base: a ready Wine <version> as released (Kron4ek's build, from its own GitHub
+  releases), not made by Wine-Fx;
 - Wine-Fx-<version>-<letter>.tar.xz: only the files the patches change (and add), with
   manifest.json. Small: a new release of the patches is only this.
 
-The script asks which release to install (Enter: the newest) and where (Enter:
+The script asks which Wine version (Enter: the newest) and where (Enter:
 ~/.local/share/wine-fx/Wine-Fx-<version>). It downloads the base when that folder has no Wine
 <version> yet, checks the SHA-256 of what it downloads, then puts the release's files in. The
 files they replace are kept next to them as <file>.wfx-orig, and share/wine-fx/overlay.json
@@ -32,7 +32,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-RELEASES = os.environ.get("WINEFX_RELEASES", "https://downloads.lis-carter.site/wine-fx/releases.json")
+RELEASES = os.environ.get("WINEFX_RELEASES", "https://github.com/fly4xy/Wine-fx/releases/latest/download/releases.json")
 STATE = "share/wine-fx/overlay.json"
 ORIG = ".wfx-orig"
 
@@ -111,14 +111,15 @@ def undo(dest: Path) -> list[str]:
     except (OSError, ValueError):
         return []
     done = []
-    for path, info in state["files"].items():
+    for path, info in state.get("files", {}).items():
         target, orig = dest / path, dest / (path + ORIG)
         if orig.exists() or orig.is_symlink():
             os.replace(orig, target)
         elif info.get("new") and (target.exists() or target.is_symlink()):
             target.unlink()
         done.append(path)
-    (dest / STATE).unlink()
+    # the Wine version stays known (a base from elsewhere has no version.txt of ours)
+    (dest / STATE).write_text(json.dumps({"wine": state["wine"]}))
     return done
 
 
@@ -186,11 +187,12 @@ def main() -> int:
                 raise FxError(f"no release {a.release} (--list)")
         elif a.yes or not sys.stdin.isatty():
             release = items[0]
-        else:
-            for i, r in enumerate(items, 1):
-                print(f"  {i}) {r['release']}  (Wine {r['wine']})")
-            answer = input("Which release? [1] ").strip() or "1"
-            release = items[int(answer) - 1]
+        else:   # the Wine version, with the newest release of the patches for it
+            newest = list({r["wine"]: r for r in reversed(items)}.values())[::-1]
+            for i, r in enumerate(newest, 1):
+                print(f"  {i}) Wine {r['wine']}  ({r['release']})")
+            answer = input("Which Wine? [1] ").strip() or "1"
+            release = newest[int(answer) - 1]
         default = Path.home() / ".local/share/wine-fx" / f"Wine-Fx-{release['wine']}"
         dest = Path(a.dest).expanduser() if a.dest else default
         if not a.dest and not a.yes and sys.stdin.isatty():
