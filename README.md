@@ -13,7 +13,7 @@ archive for each:
 | | Archive | What its script does | For |
 |---|---|---|---|
 | **Build** | `Wine-Fx-<version>-<letter>-build.tar.gz` (`build.sh`) | asks the Wine version, downloads its sources, installs the build dependencies, applies all the patches or the ones you choose, builds Wine | choosing patches, your own changes |
-| **Install** | `Wine-Fx-<version>-<letter>.tar.xz` (`wine-fx-install.py`) | asks the Wine version, downloads a ready Wine of that version and puts the release's files into it | everyone else: minutes instead of an hour, nothing to build |
+| **Install** | `Wine-Fx-<version>-<letter>.tar.xz` (`install.sh`) | asks the Wine version, downloads a ready Wine of that version and puts the release's files into it | everyone else: minutes instead of an hour, nothing to build |
 
 Unpack the archive and start its script: from a terminal, or with a double click (it opens a
 terminal by itself).
@@ -26,10 +26,10 @@ patches for Wine 11.22.
 Unpack `Wine-Fx-<version>-<letter>.tar.xz` from the release, then:
 
 ```bash
-python3 wine-fx-install.py
+bash install.sh
 ```
 
-It asks which Wine version (Enter: the newest) and where (Enter: `~/.local/share/wine-fx/Wine-Fx-<version>`).
+(or a double click on `install.sh`: it opens a terminal by itself). It asks which Wine version (Enter: the newest) and where (Enter: `~/.local/share/wine-fx/Wine-Fx-<version>`).
 The first time it downloads a ready Wine of that version as released, [Kron4ek's build](https://github.com/Kron4ek/Wine-Builds)
 (`wine-<version>-amd64-wow64`), then puts in the release's files from the archive (`files/`, a few megabytes); for another
 Wine version it downloads that version's release. All is checked against its SHA-256. An update downloads only the release's files.
@@ -41,13 +41,14 @@ The files a release replaces stay next to them as `<file>.wfx-orig`, and
 update) puts them back first, then puts the new files in. Other options:
 
 ```bash
-python3 wine-fx-install.py --list                       # the releases
-python3 wine-fx-install.py --release Wine-Fx-11.22-a    # that one, still asks where
-python3 wine-fx-install.py --undo ~/.local/share/wine-fx/Wine-Fx-11.22   # Kron4ek's Wine as it was
+bash install.sh --list                                  # the releases
+bash install.sh --dest ~/wine/Wine-Fx-11.22 --yes       # no questions
+bash install.sh --undo ~/.local/share/wine-fx/Wine-Fx-11.22   # Kron4ek's Wine as it was
 ```
 
-Only Python 3 (standard library) is needed. `WINEFX_RELEASES` sets where `releases.json`
-is (a URL or a path).
+It needs bash, curl or wget, tar with xz and sha256sum, as `build.sh` does. `install.sh` is also
+attached to each release on its own: without an archive next to it, it downloads the release
+of the Wine version you choose. `WINEFX_LIST` sets where `releases.txt` is.
 
 ## Build
 

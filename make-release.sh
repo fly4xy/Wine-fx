@@ -7,12 +7,14 @@
 #                                           build.sh asks the Wine version, downloads its
 #                                           sources, installs the dependencies, asks all patches
 #                                           or chosen ones, builds Wine.
-#   Wine-Fx-<version>-<fx>.tar.xz        2. install it ready: wine-fx-install.py and the files
-#                                           the patches change (files/, manifest.json). The
-#                                           script downloads a ready Wine of the version (the
+#   Wine-Fx-<version>-<fx>.tar.xz        2. install it ready: install.sh and the files the
+#                                           patches change (files/, SHA256SUMS, release.conf;
+#                                           manifest.json for Wine Fox). The script asks the
+#                                           Wine version, downloads a ready Wine of it (the
 #                                           base: BASE_URL of wine.conf, Kron4ek's build) and
 #                                           puts the files over it. Light: no Wine inside.
-#   releases.json, wine-fx-install.py    for Wine Fox and the script on its own
+#   releases.txt, install.sh             the list install.sh reads, and the script on its own
+#   releases.json                        the list Wine Fox reads
 #
 # (fx: FX_RELEASE of versions/<version>/wine.conf.) To know which files the patches change, Wine
 # is built without them, then they are applied to the same tree and only what they touch is
@@ -39,6 +41,7 @@ done
 FX=${FX_RELEASE:-a}
 DIST=$HERE/dist
 NAME=Wine-Fx-$VERSION-$FX
+DOWNLOADS=${DOWNLOADS:-https://github.com/fly4xy/Wine-fx/releases/download}   # <tag>/<file>
 WORK=$HERE/work/$VERSION-release      # one tree for both builds
 PREFIX=$WORK/install                  # the same prefix for both: nothing differs by its path
 mkdir -p "$DIST"
@@ -92,11 +95,14 @@ manifest = {"release": name, "wine": wine, "fx": letter,
 (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
 print(f"    {len(files)} file(s)")
 EOF
-install -m 755 "$HERE/wine-fx-install.py" "$STAGE/$NAME/"
+install -m 755 "$HERE/install.sh" "$STAGE/$NAME/"
+(cd "$STAGE/$NAME" && find files ! -type d | sort | xargs sha256sum) > "$STAGE/$NAME/SHA256SUMS"
+printf 'RELEASE=%s\nWINE=%s\nFX=%s\nBASE_URL=%s\nBASE_SIZE=%s\nBASE_SHA256=%s\n' \
+    "$NAME" "$WINE_VERSION" "$FX" "$BASE_URL" "$BASE_SIZE" "$BASE_SHA256" > "$STAGE/$NAME/release.conf"
 cat > "$STAGE/$NAME/README.txt" << EOF
 $NAME: Wine-Fx's patches for Wine $WINE_VERSION, built, to put over a ready Wine $WINE_VERSION.
 
-    python3 wine-fx-install.py
+    bash install.sh      (or a double click on install.sh)
 
 It downloads Wine $WINE_VERSION as released (Kron4ek's build: $BASE_URL)
 and puts the files of files/ over it; the files it replaces stay next to them as *.wfx-orig.
@@ -115,12 +121,12 @@ chmod -R u=rwX,go=rX "$B" && find "$B" -type f -exec chmod 644 {} +   # not the 
 install -m 755 "$HERE/build.sh" "$B/"
 tar -C "$STAGE" -czf "$DIST/$NAME-build.tar.gz" "$NAME-build"
 
-echo ">>> releases.json"
-python3 - "$DIST" "$NAME" "$WINE_VERSION" "$FX" "$HERE/versions/$VERSION/patches" "$BASE_URL" "$BASE_SIZE" "$BASE_SHA256" <<'EOF'
+echo ">>> releases.json, releases.txt"
+python3 - "$DIST" "$NAME" "$WINE_VERSION" "$FX" "$HERE/versions/$VERSION/patches" "$BASE_URL" "$BASE_SIZE" "$BASE_SHA256" "$DOWNLOADS/$VERSION-$FX" <<'EOF'
 import hashlib, json, re, sys, time
 from pathlib import Path
 dist, name, wine, letter, patches = Path(sys.argv[1]), *sys.argv[2:5], Path(sys.argv[5])
-base_url, base_size, base_sha = sys.argv[6:9]
+base_url, base_size, base_sha, downloads = sys.argv[6:10]
 def part(f):
     p = dist / f
     return {"file": f, "size": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
@@ -134,9 +140,15 @@ data["releases"] = [r for r in data["releases"] if r["release"] != name]
 data["releases"].append({"release": name, "wine": wine, "fx": letter, "date": time.strftime("%Y-%m-%d"),
                          "base": {"file": base_url.rsplit("/", 1)[1], "url": base_url,
                                   "size": int(base_size), "sha256": base_sha},
-                         "overlay": part(f"{name}.tar.xz"), "patches": subjects})
+                         "overlay": dict(part(f"{name}.tar.xz"), url=f"{downloads}/{name}.tar.xz"),
+                         "patches": subjects})
+key = lambda r: ([int(x) for x in r["wine"].split(".")], r["fx"])
+data["releases"].sort(key=key, reverse=True)
 path.write_text(json.dumps(data, indent=1) + "\n")
+# for install.sh: release, wine, archive URL, its SHA-256 (tab separated, newest first)
+(dist / "releases.txt").write_text("".join(
+    f'{r["release"]}\t{r["wine"]}\t{r["overlay"]["url"]}\t{r["overlay"]["sha256"]}\n' for r in data["releases"]))
 EOF
-install -m 755 "$HERE/wine-fx-install.py" "$DIST/"
+install -m 755 "$HERE/install.sh" "$DIST/"
 ls -la "$DIST"
 echo "attach everything in dist/ to the GitHub release $VERSION-$FX"
