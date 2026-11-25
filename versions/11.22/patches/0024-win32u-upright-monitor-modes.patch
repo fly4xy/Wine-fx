@@ -1,0 +1,63 @@
+From: Wine Fox
+Subject: [PATCH] win32u: An upright monitor has its own mode among its modes.
+
+The modes made up for a monitor with one host mode had its current and largest modes turned
+on their side when it is upright (720x1280 listed as 1280x720): the monitor's own mode was not
+one of its modes, and setting it, as explorer does at start from the registry, failed
+(DISP_CHANGE_BADMODE).
+
+They are now listed as they are. The registry's mode of a monitor is also replaced by the
+current one when the monitor no longer has a mode of its size (turned upright, replaced), as it
+is when there is none.
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index b853b9e..d05af85 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2188,14 +2188,15 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
+             count += add_virtual_mode( modes, count, &mode );
+         }
+ 
+-        mode.dmPelsWidth = vertical ? initial->dmPelsHeight : initial->dmPelsWidth;
+-        mode.dmPelsHeight = vertical ? initial->dmPelsWidth : initial->dmPelsHeight;
++        /* these two are the monitor's own: upright already when it is */
++        mode.dmPelsWidth = initial->dmPelsWidth;
++        mode.dmPelsHeight = initial->dmPelsHeight;
+         count += add_virtual_mode( modes, count, &mode );
+ 
+         if (maximum->dmPelsWidth != initial->dmPelsWidth || maximum->dmPelsHeight != initial->dmPelsHeight)
+         {
+-            mode.dmPelsWidth = vertical ? maximum->dmPelsHeight : maximum->dmPelsWidth;
+-            mode.dmPelsHeight = vertical ? maximum->dmPelsWidth : maximum->dmPelsHeight;
++            mode.dmPelsWidth = maximum->dmPelsWidth;
++            mode.dmPelsHeight = maximum->dmPelsHeight;
+             count += add_virtual_mode( modes, count, &mode );
+         }
+     }
+@@ -2205,6 +2206,15 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
+     return modes;
+ }
+ 
++/* the size of mode is one of modes' */
++static BOOL is_mode_listed( const DEVMODEW *mode, const DEVMODEW *modes, UINT count )
++{
++    while (count--)
++        if (modes[count].dmPelsWidth == mode->dmPelsWidth && modes[count].dmPelsHeight == mode->dmPelsHeight)
++            return TRUE;
++    return FALSE;
++}
++
+ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEVMODEW *host_modes, void *param )
+ {
+     struct device_manager_ctx *ctx = param;
+@@ -2255,7 +2265,9 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+         }
+     }
+ 
+-    if (current == &detached || !read_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &dummy ))
++    /* also when the monitor has no longer the registry's size (turned upright, replaced) */
++    if (current == &detached || !read_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &dummy ) ||
++        (!is_detached_mode( &dummy ) && !is_mode_listed( &dummy, modes, modes_count )))
+         write_source_mode( source->key, ENUM_REGISTRY_SETTINGS, current );
+     write_source_mode( source->key, ENUM_CURRENT_SETTINGS, current );
+ 

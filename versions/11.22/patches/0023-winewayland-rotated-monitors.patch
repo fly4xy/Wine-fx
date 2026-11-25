@@ -1,0 +1,160 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Monitors turned a quarter have their sides swapped.
+
+A wl_output gives its modes as the output has them before its transform. A monitor turned
+upright (1080x1920 on the desktop, a 1920x1080 mode, transform 90) was a lying one for Wine:
+windows maximized on it were sized for the wrong monitor, stretched by the compositor, and
+part of them did not take clicks.
+
+The output's transform is kept, and the sizes of its modes on the desktop have the sides
+swapped when it is turned a quarter.
+
+diff --git a/dlls/winewayland.drv/display.c b/dlls/winewayland.drv/display.c
+index 1d46d64..c4a7c31 100644
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -59,10 +59,10 @@ static int output_info_cmp_primary_x_y(const void *va, const void *vb)
+ 
+ static inline BOOL output_info_overlap(struct output_info *a, struct output_info *b)
+ {
+-    return b->x < a->x + a->output->current_mode->width &&
+-           b->x + b->output->current_mode->width > a->x &&
+-           b->y < a->y + a->output->current_mode->height &&
+-           b->y + b->output->current_mode->height > a->y;
++    return b->x < a->x + wayland_output_mode_width(a->output, a->output->current_mode) &&
++           b->x + wayland_output_mode_width(b->output, b->output->current_mode) > a->x &&
++           b->y < a->y + wayland_output_mode_height(a->output, a->output->current_mode) &&
++           b->y + wayland_output_mode_height(b->output, b->output->current_mode) > a->y;
+ }
+ 
+ /* Map a point to one of the four quadrants of our 2d coordinate space:
+@@ -144,16 +144,16 @@ static BOOL output_info_array_resolve_overlaps(struct wl_array *output_info_arra
+             rel_x = (move->output->logical_x - anchor->output->logical_x +
+                      (x_use_end ? move->output->logical_w : 0)) /
+                     (double)anchor->output->logical_w;
+-            move->x = anchor->x + anchor->output->current_mode->width * rel_x -
+-                      (x_use_end ? move->output->current_mode->width : 0);
++            move->x = anchor->x + wayland_output_mode_width(anchor->output, anchor->output->current_mode) * rel_x -
++                      (x_use_end ? wayland_output_mode_width(move->output, move->output->current_mode) : 0);
+ 
+             /* Similarly for the Y axis. */
+             y_use_end = move->output->logical_y < anchor->output->logical_y;
+             rel_y = (move->output->logical_y - anchor->output->logical_y +
+                      (y_use_end ? move->output->logical_h : 0)) /
+                     (double)anchor->output->logical_h;
+-            move->y = anchor->y + anchor->output->current_mode->height * rel_y -
+-                      (y_use_end ? move->output->current_mode->height : 0);
++            move->y = anchor->y + wayland_output_mode_height(anchor->output, anchor->output->current_mode) * rel_y -
++                      (y_use_end ? wayland_output_mode_height(move->output, move->output->current_mode) : 0);
+         }
+     }
+ 
+@@ -211,8 +211,8 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
+     struct gdi_monitor monitor = {0};
+ 
+     SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
+-            output_info->x + output_info->output->current_mode->width,
+-            output_info->y + output_info->output->current_mode->height);
++            output_info->x + wayland_output_mode_width(output_info->output, output_info->output->current_mode),
++            output_info->y + wayland_output_mode_height(output_info->output, output_info->output->current_mode));
+     OffsetRect(&monitor.rc_monitor, -primary->x, -primary->y);
+ 
+     /* We don't have a direct way to get the work area in Wayland. */
+@@ -224,15 +224,16 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
+     device_manager->add_monitor(&monitor, param);
+ }
+ 
+-static void populate_devmode(struct wayland_output_mode *output_mode, DEVMODEW *mode)
++static void populate_devmode(const struct wayland_output_state *output,
++                             struct wayland_output_mode *output_mode, DEVMODEW *mode)
+ {
+     mode->dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
+                      DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
+     mode->dmDisplayOrientation = DMDO_DEFAULT;
+     mode->dmDisplayFlags = 0;
+     mode->dmBitsPerPel = 32;
+-    mode->dmPelsWidth = output_mode->width;
+-    mode->dmPelsHeight = output_mode->height;
++    mode->dmPelsWidth = wayland_output_mode_width(output, output_mode);
++    mode->dmPelsHeight = wayland_output_mode_height(output, output_mode);
+     /* Round the refresh rate to calculate the win32 display frequency. */
+     mode->dmDisplayFrequency = (output_mode->refresh + 500) / 1000;
+ }
+@@ -248,7 +249,7 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
+     if (!(modes = malloc(output_info->output->modes_count * sizeof(*modes))))
+         return;
+ 
+-    populate_devmode(output_info->output->current_mode, &current);
++    populate_devmode(output_info->output, output_info->output->current_mode, &current);
+     current.dmFields |= DM_POSITION;
+     current.dmPosition.x = output_info->x - primary->x;
+     current.dmPosition.y = output_info->y - primary->y;
+@@ -257,7 +258,7 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
+                       struct wayland_output_mode, entry)
+     {
+         DEVMODEW mode = {.dmSize = sizeof(mode)};
+-        populate_devmode(output_mode, &mode);
++        populate_devmode(output_info->output, output_mode, &mode);
+         modes[modes_count++] = mode;
+     }
+ 
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+index f76881a..79dd6dc 100644
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -167,14 +167,15 @@ static void wayland_output_done(struct wayland_output *output)
+         output->current.logical_h = output->pending.logical_h;
+     }
+ 
++    output->current.transform = output->pending.transform;
+     output->pending_flags = 0;
+ 
+     /* Ensure the logical dimensions have sane values. */
+     if ((!output->current.logical_w || !output->current.logical_h) &&
+         output->current.current_mode)
+     {
+-        output->current.logical_w = output->current.current_mode->width;
+-        output->current.logical_h = output->current.current_mode->height;
++        output->current.logical_w = wayland_output_mode_width(&output->current, output->current.current_mode);
++        output->current.logical_h = wayland_output_mode_height(&output->current, output->current.current_mode);
+     }
+ 
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+@@ -200,6 +201,10 @@ static void output_handle_geometry(void *data, struct wl_output *wl_output,
+                                    const char *make, const char *model,
+                                    int32_t output_transform)
+ {
++    struct wayland_output *output = data;
++
++    /* kept in pending until the next geometry event, copied on every done */
++    output->pending.transform = output_transform;
+ }
+ 
+ static void output_handle_mode(void *data, struct wl_output *wl_output,
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index ea02d70..c9b31f7 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -238,8 +238,22 @@ struct wayland_output_state
+     char *name;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    int transform; /* wl_output_transform: modes are of the output before it */
+ };
+ 
++/* the size of a mode on the desktop: turned a quarter, the output has its sides swapped */
++static inline int wayland_output_mode_width(const struct wayland_output_state *output,
++                                            const struct wayland_output_mode *mode)
++{
++    return (output->transform & 1) ? mode->height : mode->width;
++}
++
++static inline int wayland_output_mode_height(const struct wayland_output_state *output,
++                                             const struct wayland_output_mode *mode)
++{
++    return (output->transform & 1) ? mode->width : mode->height;
++}
++
+ struct wayland_output
+ {
+     struct wl_list link;

@@ -113,8 +113,14 @@ undo()
         n=$((n + 1))
     done < "$dest/$STATE"
     printf '{\n "wine": "%s"\n}\n' "$wine" > "$dest/$STATE"
+    refresh_prefixes "$dest"
     echo "$n file(s) put back"
 }
+
+# prefixes keep copies of Wine's DLLs in system32 and take new ones only when wine.inf changed;
+# programs that check their DLLs against those files (World of Warcraft) broke the loaded ones
+# with the old copies' bytes
+refresh_prefixes() { [ ! -f "$1/share/wine/wine.inf" ] || touch "$1/share/wine/wine.inf"; }
 
 # put a release (release.conf, SHA256SUMS, files/ in $2) into $1, after undoing the one there
 apply()
@@ -135,12 +141,16 @@ apply()
             fi
             mkdir -p "$(dirname "$dest/$path")"
             cp -a "$src/files/$path" "$dest/$path"
+            # programs stay programs: a release folder copied through another system (a Windows
+            # share) loses the executable bit, and Wine without an executable wineserver cannot start
+            case $path in bin/*) [ -L "$dest/$path" ] || chmod 755 "$dest/$path" ;; esac
             printf '%s  "%s": {"sha256": "%s", "new": %s}' "$sep" "$path" "$sum" "$new"
             sep=$',\n'
         done < "$src/SHA256SUMS"
         printf '\n }\n}\n'
     } > "$dest/$STATE.new"
     mv -f "$dest/$STATE.new" "$dest/$STATE"
+    refresh_prefixes "$dest"
     echo "$(grep -c . "$src/SHA256SUMS") file(s) of $RELEASE"
 }
 

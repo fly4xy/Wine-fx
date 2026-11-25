@@ -30,7 +30,7 @@ gets WM_MOVE) when the pointer tells where it is:
 Moves asked and not done yet count for the next pointer events.
 
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
-index dcde2dc..5eae215 100755
+index 8f3ebb6..5486634 100644
 --- a/dlls/winewayland.drv/wayland_pointer.c
 +++ b/dlls/winewayland.drv/wayland_pointer.c
 @@ -136,6 +136,7 @@ static HWND wayland_pointer_get_focused_hwnd(void)
@@ -191,7 +191,7 @@ index dcde2dc..5eae215 100755
      pointer->focused_hwnd = hwnd;
      pointer->enter_serial = serial;
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 1a9693b..5358fb3 100755
+index 1a9693b..5358fb3 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -74,6 +74,7 @@ enum wayland_window_message
@@ -222,7 +222,7 @@ index 1a9693b..5358fb3 100755
      int content_width, content_height;
      HCURSOR hcursor;
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index bac1c88..c126826 100755
+index bac1c88..c126826 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -574,8 +574,10 @@ static void wayland_configure_window(HWND hwnd)

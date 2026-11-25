@@ -38,7 +38,7 @@ window managers keep them above the owner, and taskbars show them. The window ma
 them minimizes them again (0028 kept it from owned windows without a taskbar button only).
 
 diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
-index fa7fce1..f71a581 100755
+index fa7fce1..f71a581 100644
 --- a/dlls/win32u/window.c
 +++ b/dlls/win32u/window.c
 @@ -5013,6 +5013,13 @@ static BOOL show_window( HWND hwnd, INT cmd )
@@ -56,7 +56,7 @@ index fa7fce1..f71a581 100755
      {
      case SW_HIDE:
 diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
-index f94a5af..0a3cd1f 100755
+index f94a5af..0a3cd1f 100644
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
 @@ -555,6 +555,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
@@ -68,7 +68,7 @@ index f94a5af..0a3cd1f 100755
  
          if (surface->xdg_surface)
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 5358fb3..4a04a9d 100755
+index 5358fb3..4a04a9d 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -307,6 +307,7 @@ struct wayland_surface
@@ -80,7 +80,7 @@ index 5358fb3..4a04a9d 100755
              struct zxdg_toplevel_decoration_v1 *xdg_toplevel_decoration;
              uint32_t xdg_decoration_mode;  /* the mode we asked for, 0 = none yet */
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index c126826..0655539 100755
+index c126826..0655539 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -457,6 +457,35 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
@@ -128,7 +128,7 @@ index c126826..0655539 100755
      }
  
 diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
-index 6ccfbac..4db0607 100755
+index 6ccfbac..4db0607 100644
 --- a/dlls/winex11.drv/window.c
 +++ b/dlls/winex11.drv/window.c
 @@ -1144,7 +1144,17 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex

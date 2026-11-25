@@ -1,0 +1,686 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Drags out of floating windows as drags the compositor runs.
+
+Wayland does not tell where toplevels are: a floating window the compositor moved is not where
+Wine thinks. While a button is down on it, the pointer is in its coordinates wherever it goes,
+off by as much over the other windows: a tab Unreal Engine drags out of a floating window moved
+away from the centre stopped at invisible borders, and could not be docked where the pointer was.
+Wine learnt where the window is only when the pointer went straight from one window into another.
+
+Such a drag now goes on as a drag the compositor runs (wl_data_device, version 3), the
+application's decorator its image, which the compositor keeps at the pointer. It starts when an
+unowned click-through popup (Unreal's decorator of a dragged tab or asset) is shown while a button
+is down on another of our toplevels, not maximized nor fullscreen. The compositor tells over which
+of our windows the drag is and where: the pointer gets there in Wine, a straight crossing from the
+window it started from aligns that window, and the button is released on the drop, or on the
+cancel when it ends elsewhere (the pointer then just past the edge of the window it left).
+
+The drag's source is of a data device manager of version 3, bound for it: the clipboard's is bound
+at version 2, whose sources are not told of a drop on nothing. Its events come to a data device of
+its own, or to the clipboard's: KWin sends a client's drags to its first data device only (the
+clipboard's, when it does not use data control); version 2 offers take the copy action.
+
+The pointer's motions over our windows are sent at once (a drag has no wl_pointer.frame: the
+cursor stood still for the application, which showed no docking preview). The image is moved from
+the pointer as the application moves its window from the cursor (Unreal's tab over a place to dock
+it and back), with its next buffer.
+
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 5f96e40..82523a9 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -189,6 +189,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+     {
+         process_wayland.wl_data_device_manager =
+             wl_registry_bind(registry, id, &wl_data_device_manager_interface, 2);
++        if (version >= 3)
++            process_wayland.drag_data_device_manager =
++                wl_registry_bind(registry, id, &wl_data_device_manager_interface, 3);
+     }
+     else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0)
+     {
+diff --git a/dlls/winewayland.drv/wayland_data_device.c b/dlls/winewayland.drv/wayland_data_device.c
+index c080bd0..0b38874 100644
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -654,6 +654,157 @@ static const struct wl_data_source_listener data_source_listener =
+     data_source_action,
+ };
+ 
++/**********************************************************************
++ *          drags from floating windows (see wayland_pointer_drag_wanted)
++ */
++
++#define WINEWAYLAND_DRAG_MIME_TYPE "application/x.winewayland.drag"
++
++static void drag_source_target(void *data, struct wl_data_source *source, const char *mime_type)
++{
++}
++
++static void drag_source_send(void *data, struct wl_data_source *source, const char *mime_type, int32_t fd)
++{
++    close(fd);
++}
++
++static void drag_source_cancelled(void *data, struct wl_data_source *source)
++{
++    wayland_pointer_drag_end(source);
++}
++
++static void drag_source_dnd_drop_performed(void *data, struct wl_data_source *source)
++{
++}
++
++static void drag_source_dnd_finished(void *data, struct wl_data_source *source)
++{
++}
++
++static void drag_source_action(void *data, struct wl_data_source *source, uint32_t dnd_action)
++{
++}
++
++static const struct wl_data_source_listener drag_source_listener =
++{
++    drag_source_target,
++    drag_source_send,
++    drag_source_cancelled,
++    drag_source_dnd_drop_performed,
++    drag_source_dnd_finished,
++    drag_source_action,
++};
++
++void wayland_data_source_init_drag(struct wl_data_source *source)
++{
++    wl_data_source_add_listener(source, &drag_source_listener, NULL);
++    wl_data_source_offer(source, WINEWAYLAND_DRAG_MIME_TYPE);
++    wl_data_source_set_actions(source, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE | WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
++}
++
++/* The data device of our drags, of the version 3 manager. It gets every drag over our windows
++ * (also of other applications, ignored here); its events come in the Wayland thread only. */
++static struct wl_data_device *drag_device;
++static struct wl_data_offer *drag_offer;
++static HWND drag_hwnd; /* the window our drag is over */
++
++static void drag_offer_offer(void *data, struct wl_data_offer *offer, const char *type)
++{
++}
++
++static void drag_offer_source_actions(void *data, struct wl_data_offer *offer, uint32_t actions)
++{
++}
++
++static void drag_offer_action(void *data, struct wl_data_offer *offer, uint32_t action)
++{
++}
++
++static const struct wl_data_offer_listener drag_offer_listener =
++{
++    drag_offer_offer,
++    drag_offer_source_actions,
++    drag_offer_action,
++};
++
++static void drag_device_data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
++{
++    wl_data_offer_add_listener(offer, &drag_offer_listener, NULL);
++}
++
++static void drag_device_enter(void *data, struct wl_data_device *device, uint32_t serial,
++                              struct wl_surface *wl_surface, wl_fixed_t x, wl_fixed_t y,
++                              struct wl_data_offer *offer)
++{
++    HWND hwnd = wl_surface ? wl_surface_get_user_data(wl_surface) : NULL;
++
++    if (drag_offer) wl_data_offer_destroy(drag_offer);
++    drag_offer = offer;
++    drag_hwnd = NULL;
++    if (!offer || !hwnd || !wayland_pointer_drag_active()) return;
++
++    /* without an accepted type and action there is no drop, but a cancel */
++    if (wl_data_offer_get_version(offer) >= 3)
++        wl_data_offer_set_actions(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
++    wl_data_offer_accept(offer, serial, WINEWAYLAND_DRAG_MIME_TYPE);
++    drag_hwnd = hwnd;
++    wayland_pointer_drag_motion(hwnd, x, y, TRUE);
++}
++
++static void drag_device_leave(void *data, struct wl_data_device *device)
++{
++    if (drag_offer) wl_data_offer_destroy(drag_offer);
++    drag_offer = NULL;
++    if (!drag_hwnd) return;
++    drag_hwnd = NULL;
++    wayland_pointer_drag_leave();
++}
++
++static void drag_device_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x, wl_fixed_t y)
++{
++    if (drag_hwnd) wayland_pointer_drag_motion(drag_hwnd, x, y, FALSE);
++}
++
++static void drag_device_drop(void *data, struct wl_data_device *device)
++{
++    if (drag_offer) wl_data_offer_destroy(drag_offer);
++    drag_offer = NULL;
++    if (!drag_hwnd) return;
++    drag_hwnd = NULL;
++    wayland_pointer_drag_end(NULL);
++}
++
++static void drag_device_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
++{
++    if (offer) wl_data_offer_destroy(offer);
++}
++
++static const struct wl_data_device_listener drag_device_listener =
++{
++    drag_device_data_offer,
++    drag_device_enter,
++    drag_device_leave,
++    drag_device_motion,
++    drag_device_drop,
++    drag_device_selection,
++};
++
++BOOL wayland_data_device_start_drag(HWND hwnd, struct wayland_surface *icon)
++{
++    /* shortcut: made once, kept when the seat goes; a new seat has no drags from floating windows */
++    if (!drag_device)
++    {
++        pthread_mutex_lock(&process_wayland.seat.mutex);
++        if (process_wayland.seat.wl_seat &&
++            (drag_device = wl_data_device_manager_get_data_device(process_wayland.drag_data_device_manager,
++                                                                  process_wayland.seat.wl_seat)))
++            wl_data_device_add_listener(drag_device, &drag_device_listener, NULL);
++        pthread_mutex_unlock(&process_wayland.seat.mutex);
++    }
++    return drag_device && wayland_pointer_drag_start(hwnd, icon, drag_device);
++}
++
+ /**********************************************************************
+  *          wl_data_device handling
+  */
+@@ -848,6 +999,19 @@ static void data_device_enter(void *data, struct wl_data_device *wl_data_device,
+         return;
+     }
+ 
++    /* our own drag: KWin sends it to this device, the first of the process (see drag_device_enter) */
++    if (wayland_pointer_drag_active() && offer->wl)
++    {
++        struct wl_data_offer *wl_data_offer = offer->wl_data_offer;
++        char **type;
++
++        wl_array_for_each(type, &offer->types) free(*type);
++        wl_array_release(&offer->types);
++        free(offer);
++        drag_device_enter(data, wl_data_device, serial, wl_surface, x_w, y_w, wl_data_offer);
++        return;
++    }
++
+     /* the data now: files, and text */
+     wl_array_for_each(p, &offer->types)
+     {
+@@ -883,6 +1047,11 @@ static void data_device_enter(void *data, struct wl_data_device *wl_data_device,
+ 
+ static void data_device_leave(void *data, struct wl_data_device *wl_data_device)
+ {
++    if (drag_hwnd) /* our drag */
++    {
++        drag_device_leave(data, wl_data_device);
++        return;
++    }
+     pthread_mutex_lock(&dnd.mutex);
+     if (dnd.offer)
+     {
+@@ -896,6 +1065,11 @@ static void data_device_leave(void *data, struct wl_data_device *wl_data_device)
+ static void data_device_motion(void *data, struct wl_data_device *wl_data_device,
+                                uint32_t time, wl_fixed_t x_w, wl_fixed_t y_w)
+ {
++    if (drag_hwnd) /* our drag */
++    {
++        drag_device_motion(data, wl_data_device, time, x_w, y_w);
++        return;
++    }
+     pthread_mutex_lock(&dnd.mutex);
+     if (dnd.offer)
+     {
+@@ -907,6 +1081,11 @@ static void data_device_motion(void *data, struct wl_data_device *wl_data_device
+ 
+ static void data_device_drop(void *data, struct wl_data_device *wl_data_device)
+ {
++    if (drag_hwnd) /* our drag */
++    {
++        drag_device_drop(data, wl_data_device);
++        return;
++    }
+     pthread_mutex_lock(&dnd.mutex);
+     if (dnd.offer)
+     {
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index dd8b481..343c377 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -130,7 +130,8 @@ BOOL wayland_pointer_button_down_on(HWND hwnd)
+     BOOL ret;
+ 
+     pthread_mutex_lock(&pointer->mutex);
+-    ret = pointer->button_serial && pointer->focused_hwnd == hwnd;
++    ret = (pointer->button_serial && pointer->focused_hwnd == hwnd) ||
++          (pointer->drag_source && pointer->drag_origin == hwnd);
+     pthread_mutex_unlock(&pointer->mutex);
+     return ret;
+ }
+@@ -313,6 +314,197 @@ static void align_windows_on_enter(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy)
+     }
+ }
+ 
++/**********************************************************************
++ *          drags from floating windows
++ *
++ * Wayland does not tell where toplevels are: a floating window the compositor moved is not where
++ * Wine thinks. While a button is down on it, the pointer is in its coordinates wherever it goes,
++ * off over the other windows by as much: a tab or asset Unreal Engine drags out of it stopped at
++ * invisible borders and docked off the pointer. Such a drag goes on as a drag the compositor runs
++ * (wl_data_device), the application's decorator its image; the compositor tells over which of our
++ * windows it is and where, the pointer gets there in Wine, and the button is released on the drop.
++ */
++
++/* whether the window is to be the image of such a drag: an unowned click-through popup (the
++ * decorator) shown while a button is down on another toplevel of ours, not maximized nor fullscreen
++ * (those are where Wine thinks) */
++BOOL wayland_pointer_drag_wanted(HWND hwnd)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    DWORD ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    struct wayland_win_data *data;
++    HWND origin;
++    BOOL ret;
++
++    pthread_mutex_lock(&pointer->mutex);
++    ret = pointer->drag_source && pointer->drag_icon == hwnd;
++    origin = pointer->drag_source || !pointer->button_serial ? 0 : pointer->focused_hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++    if (ret || !origin) return ret;
++
++    if (!process_wayland.drag_data_device_manager) return FALSE;
++    if ((ex_style & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) != (WS_EX_LAYERED | WS_EX_TRANSPARENT)) return FALSE;
++    if ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & (WS_POPUP | WS_CHILD)) != WS_POPUP) return FALSE;
++    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
++    if (!(origin = NtUserGetAncestor(origin, GA_ROOT)) || origin == hwnd) return FALSE;
++    if (!(data = wayland_win_data_get(origin))) return FALSE;
++    ret = data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
++          !(data->wayland_surface->window.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                                                   WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN));
++    wayland_win_data_release(data);
++    return ret;
++}
++
++/* starts the drag from the window with the button down, the window's surface its image, placed
++ * from the pointer as the window is */
++BOOL wayland_pointer_drag_start(HWND hwnd, struct wayland_surface *icon, struct wl_data_device *device)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    struct wl_data_source *source;
++    POINT offset;
++    BOOL ret = FALSE;
++
++    if (!(source = wl_data_device_manager_create_data_source(process_wayland.drag_data_device_manager)))
++        return FALSE;
++    wayland_data_source_init_drag(source);
++
++    pthread_mutex_lock(&pointer->mutex);
++    if (!pointer->drag_source && pointer->button_serial && pointer->focused_surface)
++    {
++        offset.x = icon->window.rect.left - pointer->last_pos.x;
++        offset.y = icon->window.rect.top - pointer->last_pos.y;
++        icon->dnd_icon_offset = map_point_to_surface(icon, offset);
++        icon->dnd_icon_offset_pending = TRUE;
++        icon->dnd_icon_at.x = icon->dnd_icon_at.y = 0;
++        icon->dnd_icon_seen = icon->dnd_icon_offset;
++        pointer->drag_source = source;
++        pointer->drag_icon = hwnd;
++        pointer->drag_origin = NtUserGetAncestor(pointer->focused_hwnd, GA_ROOT);
++        TRACE("hwnd=%p from %p, offset %s\n", hwnd, pointer->drag_origin, wine_dbgstr_point(&offset));
++        wl_data_device_start_drag(device, source, pointer->focused_surface, icon->wl_surface,
++                                  pointer->button_serial);
++        ret = TRUE;
++    }
++    pthread_mutex_unlock(&pointer->mutex);
++
++    if (!ret) wl_data_source_destroy(source);
++    wl_display_flush(process_wayland.wl_display);
++    return ret;
++}
++
++BOOL wayland_pointer_drag_active(void)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    BOOL ret;
++
++    pthread_mutex_lock(&pointer->mutex);
++    ret = !!pointer->drag_source;
++    pthread_mutex_unlock(&pointer->mutex);
++    return ret;
++}
++
++static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy);
++static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer);
++
++/* the drag over our window: the pointer is there */
++void wayland_pointer_drag_motion(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy, BOOL enter)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++
++    /* a straight crossing from the window it started from, whose coordinates the pointer was in
++     * so far, aligns that window (see align_windows_on_enter) */
++    if (enter) align_windows_on_enter(hwnd, sx, sy);
++    pthread_mutex_lock(&pointer->mutex);
++    pointer->focused_hwnd = hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++    pointer_handle_motion_internal(sx, sy);
++    /* drags have no wl_pointer.frame, which sends win32u's accumulated motion: the cursor stood
++     * still for the application until the drop (Unreal showed no docking preview) */
++    pointer_handle_frame(NULL, NULL);
++}
++
++/* the drag left our windows: the pointer goes just past the edge of the window it left, so that
++ * a drop out there is not taken for one where it was last */
++void wayland_pointer_drag_leave(void)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    struct wayland_win_data *data;
++    INPUT input = {.type = INPUT_MOUSE};
++    POINT pos;
++    RECT rect;
++    HWND hwnd;
++    int left, right, top, bottom, best;
++
++    pthread_mutex_lock(&pointer->mutex);
++    hwnd = pointer->focused_hwnd;
++    pos = pointer->last_pos;
++    pointer->focused_hwnd = NULL;
++    pthread_mutex_unlock(&pointer->mutex);
++
++    if (!hwnd || !(data = wayland_win_data_get(hwnd))) return;
++    rect = data->rects.window;
++    wayland_win_data_release(data);
++
++    left = pos.x - rect.left;
++    right = rect.right - pos.x;
++    top = pos.y - rect.top;
++    bottom = rect.bottom - pos.y;
++    best = min(min(left, right), min(top, bottom));
++    if (best == left) pos.x = rect.left - 2;
++    else if (best == right) pos.x = rect.right + 1;
++    else if (best == top) pos.y = rect.top - 2;
++    else pos.y = rect.bottom + 1;
++
++    TRACE("hwnd=%p, to %s\n", hwnd, wine_dbgstr_point(&pos));
++    input.mi.dx = pos.x;
++    input.mi.dy = pos.y;
++    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++}
++
++/* the drag is over: the source given is cancelled (NULL: dropped); release the button there,
++ * unless the release came as a button event (the compositor did not start the drag) */
++static void drag_finish(struct wl_data_source *source, BOOL release)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    INPUT input = {.type = INPUT_MOUSE};
++    HWND origin, hwnd;
++
++    pthread_mutex_lock(&pointer->mutex);
++    if (!pointer->drag_source || (source && source != pointer->drag_source))
++    {
++        pthread_mutex_unlock(&pointer->mutex);
++        if (source) wl_data_source_destroy(source);
++        return;
++    }
++    source = pointer->drag_source;
++    origin = pointer->drag_origin;
++    hwnd = pointer->focused_hwnd ? pointer->focused_hwnd : origin;
++    input.mi.dwFlags = pointer->button_up;
++    input.mi.mouseData = pointer->button_data;
++    pointer->drag_source = NULL;
++    pointer->drag_icon = NULL;
++    pointer->drag_origin = NULL;
++    if (release)
++    {
++        pointer->button_serial = 0;
++        pointer->focused_hwnd = NULL;
++    }
++    pthread_mutex_unlock(&pointer->mutex);
++
++    TRACE("from %p, over %p, release %d\n", origin, hwnd, release);
++    wl_data_source_destroy(source);
++    if (release && input.mi.dwFlags) NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++    /* shortcut: the image is left without a drag until the application hides it (Unreal does on the
++     * release); one shown on would be invisible until it is shown again */
++    if (origin) NtUserPostMessage(origin, WM_WAYLAND_DEFERRED_HIDE, 0, 0);
++}
++
++void wayland_pointer_drag_end(struct wl_data_source *source)
++{
++    drag_finish(source, TRUE);
++}
++
+ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+                                  uint32_t serial, struct wl_surface *wl_surface,
+                                  wl_fixed_t sx, wl_fixed_t sy)
+@@ -342,6 +534,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+ 
+     pthread_mutex_lock(&pointer->mutex);
+     pointer->focused_hwnd = hwnd;
++    pointer->focused_surface = wl_surface;
+     pointer->enter_serial = serial;
+     pthread_mutex_unlock(&pointer->mutex);
+ 
+@@ -367,7 +560,9 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
+     TRACE("hwnd=%p\n", wl_surface_get_user_data(wl_surface));
+ 
+     pthread_mutex_lock(&pointer->mutex);
+-    pointer->focused_hwnd = NULL;
++    /* a drag the compositor runs for us has its own events */
++    if (!pointer->drag_source) pointer->focused_hwnd = NULL;
++    pointer->focused_surface = NULL;
+     pointer->enter_serial = 0;
+     pthread_mutex_unlock(&pointer->mutex);
+ }
+@@ -409,8 +604,16 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+     pthread_mutex_lock(&pointer->mutex);
+     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
+                              serial : 0;
++    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
++    {
++        pointer->button_up = input.mi.dwFlags << 1;
++        pointer->button_data = input.mi.mouseData;
++    }
+     pthread_mutex_unlock(&pointer->mutex);
+ 
++    /* a drag the compositor did not start: the release comes here */
++    if (state == WL_POINTER_BUTTON_STATE_RELEASED) drag_finish(NULL, FALSE);
++
+     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
+ 
+     NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 926c668..ede32e1 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -748,6 +748,9 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+         surface->popup_owner_hwnd = NULL;
+         surface->popup_configured = FALSE;
+         break;
++
++    case WAYLAND_SURFACE_ROLE_DND_ICON:
++        break;
+     }
+ 
+     memset(&surface->pending, 0, sizeof(surface->pending));
+@@ -786,7 +789,21 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
+     shm_buffer->busy = TRUE;
+     wayland_shm_buffer_ref(shm_buffer);
+ 
+-    wl_surface_attach(surface->wl_surface, shm_buffer->wl_buffer, 0, 0);
++    if (surface->role == WAYLAND_SURFACE_ROLE_DND_ICON && surface->dnd_icon_offset_pending)
++    {
++        /* a drag's image is placed from the pointer by the offsets of its buffers */
++        wl_surface_attach(surface->wl_surface, shm_buffer->wl_buffer,
++                          surface->dnd_icon_offset.x, surface->dnd_icon_offset.y);
++        /* KWin moves a drag's image by the offset of its last buffer on every commit, also those
++         * without a buffer (each frame of its Vulkan subsurface): the same buffer again with none,
++         * or the image went off on its own, further every frame */
++        wl_surface_commit(surface->wl_surface);
++        wl_surface_attach(surface->wl_surface, shm_buffer->wl_buffer, 0, 0);
++        surface->dnd_icon_at.x += surface->dnd_icon_offset.x;
++        surface->dnd_icon_at.y += surface->dnd_icon_offset.y;
++        surface->dnd_icon_offset_pending = FALSE;
++    }
++    else wl_surface_attach(surface->wl_surface, shm_buffer->wl_buffer, 0, 0);
+ 
+     /* Add surface damage, i.e., which parts of the surface have changed since
+      * the last surface commit. Note that this is different from the buffer
+@@ -1138,6 +1155,37 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+     wayland_win_data_release(owner_data);
+ }
+ 
++/* A drag's image moved from the pointer by the application (Unreal Engine's tab over a place to
++ * dock it and back: another size, and another place from the pointer) goes there too: the
++ * compositor keeps it where it was from the pointer. Moves with the pointer are within a few
++ * pixels of where it is (the cursor read a little earlier) and left alone. A new place with the
++ * pointer on the image is taken (it drags the image by where it was grabbed), another one when seen
++ * twice in a row, not once (the cursor Wine has moved and the window not yet). */
++static void wayland_surface_reconfigure_dnd_icon(struct wayland_surface *surface)
++{
++    POINT cursor, offset;
++    RECT rect = map_rect_to_surface(surface, surface->window.rect);
++    SIZE size = {rect.right - rect.left, rect.bottom - rect.top};
++
++    if (surface->dnd_icon_offset_pending || !NtUserGetCursorPos(&cursor)) return;
++    offset.x = surface->window.rect.left - cursor.x;
++    offset.y = surface->window.rect.top - cursor.y;
++    offset = map_point_to_surface(surface, offset);
++    if (abs(offset.x - surface->dnd_icon_at.x) <= 3 && abs(offset.y - surface->dnd_icon_at.y) <= 3) return;
++    if (!(offset.x <= 0 && offset.y <= 0 && -offset.x < size.cx && -offset.y < size.cy) &&
++        (abs(offset.x - surface->dnd_icon_seen.x) > 3 || abs(offset.y - surface->dnd_icon_seen.y) > 3))
++    {
++        surface->dnd_icon_seen = offset;
++        return;
++    }
++    TRACE("hwnd=%p from the pointer %s -> %s\n", surface->hwnd,
++          wine_dbgstr_point(&surface->dnd_icon_at), wine_dbgstr_point(&offset));
++    /* with its next buffer (wl_surface.offset kept moving the image on every frame in KWin) */
++    surface->dnd_icon_offset.x = offset.x - surface->dnd_icon_at.x;
++    surface->dnd_icon_offset.y = offset.y - surface->dnd_icon_at.y;
++    surface->dnd_icon_offset_pending = TRUE;
++}
++
+ /* A popup whose window moved or changed size goes to the new place (xdg_popup.reposition). */
+ void wayland_surface_reconfigure_popup(struct wayland_surface *surface)
+ {
+@@ -1194,6 +1242,9 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
+         if (!surface->popup_configured) return FALSE;
+         wayland_surface_reconfigure_popup(surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_DND_ICON:
++        wayland_surface_reconfigure_dnd_icon(surface);
++        break;
+     }
+ 
+     wayland_surface_reconfigure_size(surface, rect.right - rect.left, rect.bottom - rect.top);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index ddd90d7..ea02d70 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -93,6 +93,7 @@ enum wayland_surface_role
+     WAYLAND_SURFACE_ROLE_TOPLEVEL,
+     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+     WAYLAND_SURFACE_ROLE_POPUP,       /* xdg_popup: tooltips, kept on the screen by the compositor */
++    WAYLAND_SURFACE_ROLE_DND_ICON,    /* the image of a drag the compositor runs, with the pointer */
+ };
+ 
+ struct wayland_keyboard
+@@ -125,6 +126,12 @@ struct wayland_pointer
+     BOOL pending_warp;
+     uint32_t enter_serial;
+     uint32_t button_serial;
++    struct wl_surface *focused_surface; /* the surface the pointer entered (the window's or its client surface) */
++    DWORD button_up;                    /* MOUSEEVENTF_*UP of the button last pressed */
++    DWORD button_data;                  /* and its mouseData */
++    struct wl_data_source *drag_source; /* a drag the compositor runs for us, see wayland_pointer_drag_wanted */
++    HWND drag_icon;                     /* the window that is its image */
++    HWND drag_origin;                   /* the window it started from */
+     POINT last_pos;     /* where the last motion put the pointer, in Wine's screen coordinates */
+     DWORD last_time;    /* and when */
+     HWND last_hwnd;     /* over which window */
+@@ -194,6 +201,7 @@ struct wayland
+     struct zwp_text_input_manager_v3 *zwp_text_input_manager_v3;
+     struct zwlr_data_control_manager_v1 *zwlr_data_control_manager_v1;
+     struct wl_data_device_manager *wl_data_device_manager;
++    struct wl_data_device_manager *drag_data_device_manager; /* version 3, for our drags */
+     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
+     struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1;
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+@@ -340,6 +348,10 @@ struct wayland_surface
+     int content_width, content_height;
+     HCURSOR hcursor;
+     BOOL hide_deferred;       /* hidden while a pointer button was down on it: shown transparent until the release */
++    POINT dnd_icon_offset;    /* a drag's image: its move from where it is, for its next buffer */
++    BOOL dnd_icon_offset_pending;
++    POINT dnd_icon_at;        /* where it is from the pointer, in surface coordinates */
++    POINT dnd_icon_seen;      /* where the application put it last, when not there */
+     UINT remote_cursor;       /* shape set by another process over a child of it (WM_WAYLAND_REMOTE_CURSOR), 0 = none */
+ };
+ 
+@@ -521,6 +533,14 @@ void wayland_keyboard_deactivate(HWND hwnd);
+ void wayland_set_remote_cursor(HWND hwnd, UINT shape);
+ HWND wayland_pointer_get_focused_toplevel(void);
+ BOOL wayland_pointer_button_down_on(HWND hwnd);
++BOOL wayland_pointer_drag_wanted(HWND hwnd);
++BOOL wayland_pointer_drag_start(HWND hwnd, struct wayland_surface *icon, struct wl_data_device *device);
++BOOL wayland_pointer_drag_active(void);
++void wayland_pointer_drag_motion(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy, BOOL enter);
++void wayland_pointer_drag_leave(void);
++void wayland_pointer_drag_end(struct wl_data_source *source);
++BOOL wayland_data_device_start_drag(HWND hwnd, struct wayland_surface *icon);
++void wayland_data_source_init_drag(struct wl_data_source *source);
+ void wayland_surface_attach_transparent(struct wayland_surface *surface);
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 491447d..a574e02 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -223,6 +223,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     if ((surface = data->wayland_surface)) surface->hide_deferred = FALSE;
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
++    else if (!data->managed && wayland_pointer_drag_wanted(data->hwnd)) role = WAYLAND_SURFACE_ROLE_DND_ICON;
+     else if (!data->managed && is_tooltip(data->hwnd, owner_surface)) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+@@ -269,6 +270,13 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         wayland_win_data_get_config(data, &surface->window);
+         wayland_surface_make_popup(surface, owner_surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_DND_ICON:
++        if (surface->role == WAYLAND_SURFACE_ROLE_DND_ICON) break;
++        /* placed from the pointer as the window is */
++        wayland_win_data_get_config(data, &surface->window);
++        surface->role = WAYLAND_SURFACE_ROLE_DND_ICON;
++        wayland_data_device_start_drag(data->hwnd, surface);
++        break;
+     }
+ 
+     wayland_win_data_get_config(data, &surface->window);
+@@ -370,6 +378,8 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+         /* moved without being drawn again: no flush would reposition it */
+         if (surface->xdg_popup && surface->popup_configured) wayland_surface_reconfigure_popup(surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_DND_ICON:
++        break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         TRACE("hwnd=%p subsurface owner=%p\n", surface->hwnd, surface->owner_hwnd);
+         /* Although subsurfaces don't have a dedicated surface config mechanism,

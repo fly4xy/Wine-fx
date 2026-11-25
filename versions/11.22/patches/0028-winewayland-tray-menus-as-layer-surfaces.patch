@@ -1,0 +1,655 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Menus of tray icons where the tray was clicked (wlr-layer-shell).
+
+A tray icon's menu has no shown window of ours to be an xdg_popup of. Its window is often hidden
+in the tray: Wine's menus were then subsurfaces of that hidden window and not shown at all, and
+Qt's (Battle.net) were windows in the middle of the screen. When the window is shown, the menu
+was placed from where Wine has that window, not where the compositor shows it, nor at the icon.
+
+Such menus and popups are layer surfaces now (zwlr_layer_shell_v1, KWin, wlroots compositors),
+on the overlay layer, where Wine has them on the output: the menus Wine's xdg_popups are, and
+Qt's (QWindowPopup classes), when their owner is hidden, a layer surface (a submenu) or none, or
+when they open at the cursor while the pointer is on no window of ours. Unreal Engine's windows
+are left as they are. Another application taking the keyboard closes them, as a click out of
+them, which they do not see, would. wlr-layer-shell-unstable-v1.xml has the interfaces of
+wlroots' protocol. Without the protocol (GNOME) nothing changes.
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index e6df653..b40c453 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -32,6 +32,7 @@ SOURCES = \
+ 	window.c \
+ 	window_surface.c \
+ 	wlr-data-control-unstable-v1.xml \
++	wlr-layer-shell-unstable-v1.xml \
+ 	xdg-decoration-unstable-v1.xml \
+ 	xdg-output-unstable-v1.xml \
+ 	xdg-shell.xml \
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 82523a9..963d33e 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -209,6 +209,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+             wl_registry_bind(registry, id, &wp_cursor_shape_manager_v1_interface,
+                              version < 2 ? version : 2);
+     }
++    else if (strcmp(interface, "zwlr_layer_shell_v1") == 0)
++    {
++        process_wayland.zwlr_layer_shell_v1 =
++            wl_registry_bind(registry, id, &zwlr_layer_shell_v1_interface, version < 4 ? version : 4);
++    }
+     else if (strcmp(interface, "wp_pointer_warp_v1") == 0)
+     {
+         process_wayland.wp_pointer_warp_v1 =
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+index ba2cc48..dc68233 100644
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -860,11 +860,30 @@ void wayland_keyboard_deactivate(HWND hwnd)
+ {
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+     HWND focused, foreground = NtUserGetForegroundWindow();
++    struct wayland_win_data *data;
++    BOOL layer = FALSE;
+ 
+     pthread_mutex_lock(&keyboard->mutex);
+     focused = keyboard->focused_hwnd;
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
++    if (!focused && (data = wayland_win_data_get(hwnd)))
++    {
++        layer = data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_LAYER;
++        wayland_win_data_release(data);
++    }
++    /* A menu on a layer surface (a tray icon's) does not see the clicks out of it that close a
++     * menu: another application taking the keyboard closes it, as a click there would (Wine's
++     * menus end on WM_CANCELMODE, Qt's on losing the capture or the activation). */
++    if (layer)
++    {
++        TRACE("popup %p lost the keyboard to another application\n", hwnd);
++        NtUserReleaseCapture();
++        NtUserPostMessage(hwnd, WM_CANCELMODE, 0, 0);
++        if (foreground) NtUserSetForegroundWindow(NtUserGetDesktopWindow());
++        return;
++    }
++
+     if (focused || !foreground || NtUserGetAncestor(foreground, GA_ROOT) != NtUserGetAncestor(hwnd, GA_ROOT)) return;
+     TRACE("hwnd %p lost the keyboard to another application\n", hwnd);
+     NtUserSetForegroundWindow(NtUserGetDesktopWindow());
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+index 79dd6dc..6664a3f 100644
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -399,3 +399,41 @@ void wayland_output_use_xdg_extension(struct wayland_output *output)
+     zxdg_output_v1_add_listener(output->zxdg_output_v1, &zxdg_output_v1_listener,
+                                 output);
+ }
++
++/**********************************************************************
++ *          wayland_output_at
++ *
++ * The output at a point of Wine's virtual screen, and the point on it in the output's logical
++ * coordinates. The outputs are where UpdateDisplayDevices puts them: at their logical positions,
++ * from the first one.
++ * shortcut: the overlaps UpdateDisplayDevices resolves (fractional scales side by side) are not,
++ * a layer surface can be off on such setups; share its arrangement if they turn up.
++ */
++struct wl_output *wayland_output_at(int x, int y, POINT *pos)
++{
++    struct wayland_output *output, *primary = NULL, *found = NULL;
++    struct wl_output *ret = NULL;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        struct wayland_output_state *state = &output->current;
++        int left, top, width, height;
++
++        if (!state->current_mode) continue;
++        if (!primary) primary = output;
++        left = state->logical_x - primary->current.logical_x;
++        top = state->logical_y - primary->current.logical_y;
++        width = wayland_output_mode_width(state, state->current_mode);
++        height = wayland_output_mode_height(state, state->current_mode);
++        if (x < left || y < top || x >= left + width || y >= top + height) continue;
++        pos->x = state->logical_w > 0 ? (x - left) * state->logical_w / width : x - left;
++        pos->y = state->logical_h > 0 ? (y - top) * state->logical_h / height : y - top;
++        found = output;
++        break;
++    }
++    if (!found && (found = primary)) pos->x = pos->y = 0;
++    if (found) ret = found->wl_output;
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    return ret;
++}
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 40ac52b..06ce6f1 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -675,6 +675,116 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
+     wl_display_flush(process_wayland.wl_display);
+ }
+ 
++static void layer_surface_handle_configure(void *private, struct zwlr_layer_surface_v1 *layer_surface,
++                                           uint32_t serial, uint32_t width, uint32_t height)
++{
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    BOOL initial = FALSE;
++    HWND hwnd = private;
++
++    TRACE("hwnd=%p serial=%u %ux%u\n", hwnd, serial, width, height);
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if ((surface = data->wayland_surface) && surface->layer_surface == layer_surface)
++    {
++        zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
++        initial = !surface->layer_configured;
++        surface->layer_configured = TRUE;
++        if (!initial) wl_surface_commit(surface->wl_surface);
++    }
++    wayland_win_data_release(data);
++
++    /* the contents could not be shown before the first configure */
++    if (initial) NtUserExposeWindowSurface(hwnd, 0, NULL);
++}
++
++static void layer_surface_handle_closed(void *private, struct zwlr_layer_surface_v1 *layer_surface)
++{
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    HWND hwnd = private;
++
++    TRACE("hwnd=%p\n", hwnd);
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if ((surface = data->wayland_surface) && surface->layer_surface == layer_surface)
++        wayland_surface_clear_role(surface);
++    wayland_win_data_release(data);
++}
++
++static const struct zwlr_layer_surface_v1_listener layer_surface_listener =
++{
++    layer_surface_handle_configure,
++    layer_surface_handle_closed,
++};
++
++/* where the window is on its output: margins from the output's top left, and its size */
++static struct wl_output *layer_surface_place(struct wayland_surface *surface, RECT *place)
++{
++    RECT rect = map_rect_to_surface(surface, surface->window.rect);
++    struct wl_output *output;
++    POINT pos;
++
++    output = wayland_output_at(surface->window.rect.left, surface->window.rect.top, &pos);
++    SetRect(place, pos.x, pos.y, pos.x + max(1, rect.right - rect.left), pos.y + max(1, rect.bottom - rect.top));
++    return output;
++}
++
++/**********************************************************************
++ *          wayland_surface_make_layer
++ *
++ * Gives the wayland surface the role of a layer surface on the overlay layer, at the window's
++ * place: the menus and popups that have no window of ours to be xdg_popups of (a tray icon's menu,
++ * its window hidden in the tray), which the compositor would show as windows in the middle of the
++ * screen.
++ */
++void wayland_surface_make_layer(struct wayland_surface *surface)
++{
++    struct wl_output *output;
++    RECT place;
++
++    assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_LAYER);
++    if (surface->layer_surface) return;
++
++    wayland_surface_clear_role(surface);
++    surface->role = WAYLAND_SURFACE_ROLE_LAYER;
++
++    output = layer_surface_place(surface, &place);
++    TRACE("surface=%p at %s of output %p\n", surface, wine_dbgstr_rect(&place), output);
++    surface->layer_surface = zwlr_layer_shell_v1_get_layer_surface(process_wayland.zwlr_layer_shell_v1,
++            surface->wl_surface, output, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "wine");
++    zwlr_layer_surface_v1_add_listener(surface->layer_surface, &layer_surface_listener, surface->hwnd);
++    zwlr_layer_surface_v1_set_anchor(surface->layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
++                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
++    /* from the output's edges, not moved off panels */
++    zwlr_layer_surface_v1_set_exclusive_zone(surface->layer_surface, -1);
++    /* keys once clicked, and losing them when another window is clicked closes a menu */
++    if (zwlr_layer_shell_v1_get_version(process_wayland.zwlr_layer_shell_v1) >= 4)
++        zwlr_layer_surface_v1_set_keyboard_interactivity(surface->layer_surface,
++                ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND);
++    zwlr_layer_surface_v1_set_margin(surface->layer_surface, place.top, 0, 0, place.left);
++    zwlr_layer_surface_v1_set_size(surface->layer_surface, place.right - place.left, place.bottom - place.top);
++    surface->layer_place = place;
++
++    wayland_surface_init_fractional_scale(surface, 1.0);
++    wl_surface_commit(surface->wl_surface);
++    wl_display_flush(process_wayland.wl_display);
++}
++
++/* A layer surface whose window moved or changed size goes there: TRUE if it was asked to. */
++BOOL wayland_surface_reconfigure_layer(struct wayland_surface *surface)
++{
++    RECT place;
++
++    layer_surface_place(surface, &place);
++    if (EqualRect(&place, &surface->layer_place)) return FALSE;
++    TRACE("hwnd=%p %s\n", surface->hwnd, wine_dbgstr_rect(&place));
++    zwlr_layer_surface_v1_set_margin(surface->layer_surface, place.top, 0, 0, place.left);
++    zwlr_layer_surface_v1_set_size(surface->layer_surface, place.right - place.left, place.bottom - place.top);
++    surface->layer_place = place;
++    return TRUE;
++}
++
+ /**********************************************************************
+  *          wayland_surface_clear_role
+  *
+@@ -757,6 +867,15 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ 
+     case WAYLAND_SURFACE_ROLE_DND_ICON:
+         break;
++
++    case WAYLAND_SURFACE_ROLE_LAYER:
++        if (surface->layer_surface)
++        {
++            zwlr_layer_surface_v1_destroy(surface->layer_surface);
++            surface->layer_surface = NULL;
++        }
++        surface->layer_configured = FALSE;
++        break;
+     }
+ 
+     memset(&surface->pending, 0, sizeof(surface->pending));
+@@ -1251,6 +1370,11 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
+     case WAYLAND_SURFACE_ROLE_DND_ICON:
+         wayland_surface_reconfigure_dnd_icon(surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_LAYER:
++        if (!surface->layer_surface) break; /* closed or role cleared */
++        if (!surface->layer_configured) return FALSE;
++        wayland_surface_reconfigure_layer(surface);
++        break;
+     }
+ 
+     wayland_surface_reconfigure_size(surface, rect.right - rect.left, rect.bottom - rect.top);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 223d0b1..0c1d94c 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -38,6 +38,7 @@
+ #include "xdg-output-unstable-v1-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
++#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+ #include "xdg-toplevel-icon-v1-client-protocol.h"
+ #include "pointer-warp-v1-client-protocol.h"
+ #include "alpha-modifier-v1-client-protocol.h"
+@@ -94,6 +95,7 @@ enum wayland_surface_role
+     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+     WAYLAND_SURFACE_ROLE_POPUP,       /* xdg_popup: tooltips, kept on the screen by the compositor */
+     WAYLAND_SURFACE_ROLE_DND_ICON,    /* the image of a drag the compositor runs, with the pointer */
++    WAYLAND_SURFACE_ROLE_LAYER,       /* zwlr_layer_surface_v1: a popup with no window of ours to be relative to */
+ };
+ 
+ struct wayland_keyboard
+@@ -206,6 +208,7 @@ struct wayland
+     struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1;
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
++    struct zwlr_layer_shell_v1 *zwlr_layer_shell_v1;
+     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
+     struct wp_color_manager_v1 *wp_color_manager_v1;
+     struct wayland_seat seat;
+@@ -353,6 +356,10 @@ struct wayland_surface
+     RECT popup_rect;          /* where it was asked to be, relative to the owner's window geometry */
+     RECT popup_window;        /* its window rect (Wine's coordinates) where the compositor shows it */
+     UINT popup_token;
++    /* WAYLAND_SURFACE_ROLE_LAYER */
++    struct zwlr_layer_surface_v1 *layer_surface;
++    BOOL layer_configured;
++    RECT layer_place;         /* where it was asked to be on its output, in the output's coordinates */
+     RECT geometry;            /* a toplevel's window geometry as set, in surface coordinates */
+ 
+     struct wayland_surface_config pending, requested, processing, current;
+@@ -384,6 +391,7 @@ BOOL wayland_process_init(void);
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_destroy(struct wayland_output *output);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
++struct wl_output *wayland_output_at(int x, int y, POINT *pos);
+ 
+ /**********************************************************************
+  *          Wayland surface
+@@ -400,6 +408,8 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+ void wayland_surface_make_popup(struct wayland_surface *surface,
+                                 struct wayland_surface *owner);
+ void wayland_surface_reconfigure_popup(struct wayland_surface *surface);
++void wayland_surface_make_layer(struct wayland_surface *surface);
++BOOL wayland_surface_reconfigure_layer(struct wayland_surface *surface);
+ void wayland_surface_clear_role(struct wayland_surface *surface);
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 98fd135..9d78bb8 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -34,6 +34,7 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
++WINE_DECLARE_DEBUG_CHANNEL(systray);
+ 
+ 
+ static int wayland_win_data_cmp_rb(const void *key,
+@@ -181,22 +182,28 @@ static void reapply_cursor_clipping(void)
+  * drop-downs: topmost tool popups, not layered), with input: Wine does not know where
+  * a maximized window is under a panel, and one at the bottom went off the screen. Not Unreal
+  * Engine's windows, which place their menus themselves. *input tells which. */
+-static BOOL is_popup(HWND hwnd, struct wayland_surface *owner_surface, BOOL *input)
++static BOOL is_popup_window(HWND hwnd, BOOL for_layer, BOOL *input)
+ {
+     static const WCHAR tooltipsW[] = {'t','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2',0};
+     static const WCHAR menuW[] = {'#','3','2','7','6','8',0};
+     static const WCHAR unrealW[] = {'U','n','r','e','a','l','W','i','n','d','o','w',0};
+     static const WCHAR combo_listW[] = {'C','o','m','b','o','L','B','o','x',0};
++    static const WCHAR qt_popupW[] = {'Q','W','i','n','d','o','w','P','o','p','u','p',0};
+     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE), ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+     WCHAR buffer[64];
+     UNICODE_STRING name = {.Buffer = buffer, .MaximumLength = sizeof(buffer)};
+     BOOL named = FALSE;
++    const WCHAR *p;
+ 
+     *input = FALSE;
+-    if (!owner_surface || !wayland_surface_is_toplevel(owner_surface) || !owner_surface->xdg_surface) return FALSE;
+-    if (xdg_wm_base_get_version(process_wayland.xdg_wm_base) < 3) return FALSE;
+     if (NtUserGetClassName(hwnd, FALSE, &name)) named = TRUE;
+     else buffer[0] = 0;
++    /* Unreal Engine's popups have a window of theirs, and it places them itself */
++    if (for_layer && named && !wcsicmp(buffer, unrealW)) return FALSE;
++    /* Qt's menus (Qt5QWindowPopupDropShadowSaveBits...): Battle.net's tray icon menu */
++    if (for_layer && named)
++        for (p = buffer; (p = wcschr(p, 'Q')); p++)
++            if (!wcsncmp(p, qt_popupW, ARRAY_SIZE(qt_popupW) - 1)) return (*input = TRUE);
+     /* a combo box's list: a child of the desktop */
+     if (named && !wcsicmp(buffer, combo_listW)) return (*input = TRUE);
+     if ((style & (WS_POPUP | WS_CHILD)) != WS_POPUP) return FALSE;
+@@ -211,6 +218,50 @@ static BOOL is_popup(HWND hwnd, struct wayland_surface *owner_surface, BOOL *inp
+            (WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
+ }
+ 
++static BOOL is_popup(HWND hwnd, struct wayland_surface *owner_surface, BOOL *input)
++{
++    *input = FALSE;
++    if (!owner_surface || !wayland_surface_is_toplevel(owner_surface) || !owner_surface->xdg_surface) return FALSE;
++    if (xdg_wm_base_get_version(process_wayland.xdg_wm_base) < 3) return FALSE;
++    return is_popup_window(hwnd, FALSE, input);
++}
++
++/* a popup at the cursor, the pointer on no window of ours: a tray icon's menu (programs open it
++ * at the cursor, which explorer puts where the tray was clicked) */
++static BOOL is_at_outer_cursor(const RECT *rect)
++{
++    RECT near = *rect;
++    POINT pt;
++
++    if (wayland_pointer_get_focused_toplevel() || !NtUserGetCursorPos(&pt)) return FALSE;
++    InflateRect(&near, 2, 2);
++    return PtInRect(&near, pt);
++}
++
++/* The same windows, and Qt's menus, when they have no shown window of ours to be xdg_popups of:
++ * a tray icon's menu, its window hidden in the tray (Battle.net), was a subsurface of that hidden
++ * window (not shown at all) or a window in the middle of the screen (Qt's). Their owner is hidden
++ * or a layer surface itself (a submenu), or they have none. Also those opened at the cursor while
++ * the pointer is on no window of ours (a tray icon's menu, its window shown): placed from where
++ * Wine has the owner, they were not where the compositor shows it, nor at the icon. */
++static BOOL is_layer(struct wayland_win_data *data, struct wayland_surface *owner_surface, BOOL *input)
++{
++    struct wayland_surface *surface = data->wayland_surface;
++
++    *input = FALSE;
++    if (!process_wayland.zwlr_layer_shell_v1 || data->managed) return FALSE;
++    if ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & (WS_POPUP | WS_CHILD)) != WS_POPUP) return FALSE;
++    if (!is_popup_window(data->hwnd, TRUE, input)) return FALSE;
++    if (surface && surface->layer_surface) return TRUE;
++    if (!owner_surface || owner_surface->role == WAYLAND_SURFACE_ROLE_LAYER ||
++        owner_surface->role == WAYLAND_SURFACE_ROLE_NONE ||
++        (owner_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && !owner_surface->xdg_toplevel))
++        return TRUE;
++    /* a popup of a shown window keeps the role it has while it is shown */
++    if (surface && (surface->xdg_popup || surface->wl_subsurface || surface->xdg_toplevel)) return FALSE;
++    return is_at_outer_cursor(&data->rects.window);
++}
++
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
+ {
+     struct wayland_surface *surface;
+@@ -247,16 +298,28 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     if (visible && surface && surface->xdg_minimized && wayland_surface_is_toplevel(surface) &&
+         !(NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_MINIMIZE))
+     {
+-        TRACE("hwnd=%p restored while minimized by the compositor\n", data->hwnd);
++        TRACE_(systray)("hwnd=%p restored while minimized by the compositor\n", data->hwnd);
+         wayland_surface_clear_role(surface);
+     }
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+     else if (!data->managed && wayland_pointer_drag_wanted(data->hwnd)) role = WAYLAND_SURFACE_ROLE_DND_ICON;
++    else if (is_layer(data, owner_surface, &popup_input)) role = WAYLAND_SURFACE_ROLE_LAYER;
+     else if (!data->managed && is_popup(data->hwnd, owner_surface, &popup_input)) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
++    if (TRACE_ON(systray) && role && (!data->wayland_surface || data->wayland_surface->role != role))
++    {
++        WCHAR class[64];
++        UNICODE_STRING name = {.Buffer = class, .MaximumLength = sizeof(class)};
++        if (!NtUserGetClassName(data->hwnd, FALSE, &name)) class[0] = 0;
++        TRACE_(systray)("hwnd=%p class %s style %#x exstyle %#x owner %p (role %d) managed %d -> role %d\n",
++                        data->hwnd, debugstr_w(class), (int)NtUserGetWindowLongW(data->hwnd, GWL_STYLE),
++                        (int)exstyle, NtUserGetWindowRelative(data->hwnd, GW_OWNER),
++                        owner_surface ? owner_surface->role : -1, data->managed, role);
++    }
++
+     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
+     if ((surface = data->wayland_surface) && role && surface->role && surface->role != role)
+     {
+@@ -274,7 +337,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+      * Windows behavior. */
+     /* and tooltips: slid in at the edge of the screen one can be under the pointer, and the item
+      * it is the tooltip of losing the pointer hides it (it flickered, at the right edge) */
+-    input_region = ((role == WAYLAND_SURFACE_ROLE_POPUP && !popup_input) ||
++    input_region = (((role == WAYLAND_SURFACE_ROLE_POPUP || role == WAYLAND_SURFACE_ROLE_LAYER) && !popup_input) ||
+                     ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED))) ?
+                    wl_compositor_create_region(process_wayland.wl_compositor) :
+                    NULL;
+@@ -300,6 +363,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         wayland_win_data_get_config(data, &surface->window);
+         wayland_surface_make_popup(surface, owner_surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_LAYER:
++        /* its place is needed to create it */
++        wayland_win_data_get_config(data, &surface->window);
++        wayland_surface_make_layer(surface);
++        break;
+     case WAYLAND_SURFACE_ROLE_DND_ICON:
+         if (surface->role == WAYLAND_SURFACE_ROLE_DND_ICON) break;
+         /* placed from the pointer as the window is */
+@@ -365,6 +433,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+         if (surface->window.minimized)
+         {
+             xdg_toplevel_set_minimized(surface->xdg_toplevel);
++            if (!surface->xdg_minimized) TRACE_(systray)("hwnd=%p minimized\n", surface->hwnd);
+             surface->xdg_minimized = TRUE;
+         }
+     }
+@@ -409,6 +478,11 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+         /* moved without being drawn again: no flush would reposition it */
+         if (surface->xdg_popup && surface->popup_configured) wayland_surface_reconfigure_popup(surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_LAYER:
++        /* the same, and its new margins need a commit */
++        if (surface->layer_surface && surface->layer_configured && wayland_surface_reconfigure_layer(surface))
++            wl_surface_commit(surface->wl_surface);
++        break;
+     case WAYLAND_SURFACE_ROLE_DND_ICON:
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+@@ -493,6 +567,14 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+     if ((style & WS_POPUP) && !(style & WS_THICKFRAME) && (style & WS_CAPTION) != WS_CAPTION &&
+         !(ex_style & WS_EX_APPWINDOW) && !fullscreen && NtUserGetWindowRelative(hwnd, GW_OWNER))
+         return FALSE;
++    /* and menus with no owner, a tray icon's (Battle.net's Qt menu): activated by the program, they
++     * were toplevels in the middle of the screen */
++    if ((style & WS_POPUP) && !(style & WS_THICKFRAME) && (style & WS_CAPTION) != WS_CAPTION &&
++        !(ex_style & WS_EX_APPWINDOW) && !fullscreen && process_wayland.zwlr_layer_shell_v1)
++    {
++        BOOL input;
++        if (is_popup_window(hwnd, TRUE, &input)) return FALSE;
++    }
+     /* activated windows are managed */
+     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+     if (hwnd == get_active_window()) return TRUE;
+@@ -753,9 +835,12 @@ static void wayland_configure_window(HWND hwnd)
+     restoring_from_minimize = surface->window.rect.left <= -32000 &&
+                               surface->window.rect.top  <= -32000 &&
+                               surface->window.minimized && surface->processing.activated;
++    if (surface->window.minimized)
++        TRACE_(systray)("hwnd=%p configure while minimized: %dx%d state %#x activated %d\n", hwnd,
++                        width, height, (int)surface->processing.state, surface->processing.activated);
+     if (restoring_from_minimize)
+     {
+-        TRACE("hwnd=%p restoring from minimize\n", hwnd);
++        TRACE_(systray)("hwnd=%p restoring from minimize\n", hwnd);
+         surface->xdg_minimized = FALSE;
+         surface->current = surface->processing;
+         memset(&surface->processing, 0, sizeof(surface->processing));
+diff --git a/dlls/winewayland.drv/wlr-layer-shell-unstable-v1.xml b/dlls/winewayland.drv/wlr-layer-shell-unstable-v1.xml
+new file mode 100644
+index 0000000..982cf8a
+--- /dev/null
++++ b/dlls/winewayland.drv/wlr-layer-shell-unstable-v1.xml
+@@ -0,0 +1,124 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="wlr_layer_shell_unstable_v1">
++  <copyright>
++    Copyright © 2017 Drew DeVault
++
++    Permission to use, copy, modify, distribute, and sell this
++    software and its documentation for any purpose is hereby granted
++    without fee, provided that the above copyright notice appear in
++    all copies and that both that copyright notice and this permission
++    notice appear in supporting documentation, and that the name of
++    the copyright holders not be used in advertising or publicity
++    pertaining to distribution of the software without specific,
++    written prior permission.  The copyright holders make no
++    representations about the suitability of this software for any
++    purpose.  It is provided "as is" without express or implied
++    warranty.
++
++    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
++    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
++    THIS SOFTWARE.
++  </copyright>
++
++  <!-- The interfaces of wlroots' wlr-layer-shell-unstable-v1 (wlr-protocols) up to version 4,
++       without their documentation: surfaces placed on an output by the client, above or below
++       the windows. -->
++
++  <interface name="zwlr_layer_shell_v1" version="4">
++    <request name="get_layer_surface">
++      <arg name="id" type="new_id" interface="zwlr_layer_surface_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++      <arg name="output" type="object" interface="wl_output" allow-null="true"/>
++      <arg name="layer" type="uint" enum="layer"/>
++      <arg name="namespace" type="string"/>
++    </request>
++
++    <enum name="error">
++      <entry name="role" value="0"/>
++      <entry name="invalid_layer" value="1"/>
++      <entry name="already_constructed" value="2"/>
++    </enum>
++
++    <enum name="layer">
++      <entry name="background" value="0"/>
++      <entry name="bottom" value="1"/>
++      <entry name="top" value="2"/>
++      <entry name="overlay" value="3"/>
++    </enum>
++
++    <request name="destroy" type="destructor" since="3"/>
++  </interface>
++
++  <interface name="zwlr_layer_surface_v1" version="4">
++    <request name="set_size">
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </request>
++
++    <request name="set_anchor">
++      <arg name="anchor" type="uint" enum="anchor"/>
++    </request>
++
++    <request name="set_exclusive_zone">
++      <arg name="zone" type="int"/>
++    </request>
++
++    <request name="set_margin">
++      <arg name="top" type="int"/>
++      <arg name="right" type="int"/>
++      <arg name="bottom" type="int"/>
++      <arg name="left" type="int"/>
++    </request>
++
++    <enum name="keyboard_interactivity">
++      <entry name="none" value="0"/>
++      <entry name="exclusive" value="1"/>
++      <entry name="on_demand" value="2" since="4"/>
++    </enum>
++
++    <request name="set_keyboard_interactivity">
++      <arg name="keyboard_interactivity" type="uint" enum="keyboard_interactivity"/>
++    </request>
++
++    <request name="get_popup">
++      <arg name="popup" type="object" interface="xdg_popup"/>
++    </request>
++
++    <request name="ack_configure">
++      <arg name="serial" type="uint"/>
++    </request>
++
++    <request name="destroy" type="destructor"/>
++
++    <event name="configure">
++      <arg name="serial" type="uint"/>
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </event>
++
++    <event name="closed"/>
++
++    <enum name="error">
++      <entry name="invalid_surface_state" value="0"/>
++      <entry name="invalid_size" value="1"/>
++      <entry name="invalid_anchor" value="2"/>
++      <entry name="invalid_keyboard_interactivity" value="3"/>
++    </enum>
++
++    <enum name="anchor" bitfield="true">
++      <entry name="top" value="1"/>
++      <entry name="bottom" value="2"/>
++      <entry name="left" value="4"/>
++      <entry name="right" value="8"/>
++    </enum>
++
++    <request name="set_layer" since="2">
++      <arg name="layer" type="uint" enum="zwlr_layer_shell_v1.layer"/>
++    </request>
++  </interface>
++</protocol>

@@ -1,0 +1,114 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: A window minimized by the program is restored by it again.
+
+A window minimized by the program (Battle.net, to its tray icon) got a configure from KWin right
+after: it lost the focus and its frame changed. Wine took that for the compositor restoring the
+window and restored it, while KWin kept it minimized. The program then had it restored, did not
+restore it again from its tray icon, and the window could not be shown at all.
+
+Only a configure that activates the window restores it now. xdg_toplevel has no request to
+unminimize, so a window the program restores while the compositor keeps it minimized is shown
+again as a new xdg_toplevel.
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index ede32e1..40ac52b 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -177,11 +177,15 @@ static void xdg_toplevel_handle_configure(void *private,
+     uint32_t *state;
+     enum wayland_surface_config_state config_state = 0;
+     struct wayland_win_data *data;
++    BOOL activated = FALSE;
+ 
+     wl_array_for_each(state, states)
+     {
+         switch(*state)
+         {
++        case XDG_TOPLEVEL_STATE_ACTIVATED:
++            activated = TRUE;
++            break;
+         case XDG_TOPLEVEL_STATE_MAXIMIZED:
+             config_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
+             break;
+@@ -210,6 +214,7 @@ static void xdg_toplevel_handle_configure(void *private,
+     {
+         SetRect(&surface->pending.rect, 0, 0, width, height);
+         surface->pending.state = config_state;
++        surface->pending.activated = activated;
+     }
+ 
+     wayland_win_data_release(data);
+@@ -715,6 +720,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+             xdg_toplevel_destroy(surface->xdg_toplevel);
+             surface->xdg_toplevel = NULL;
+             surface->xdg_parent = NULL;
++            surface->xdg_minimized = FALSE;
+         }
+ 
+         if (surface->xdg_surface)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index c9b31f7..223d0b1 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -271,6 +271,7 @@ struct wayland_surface_config
+     enum wayland_surface_config_state state;
+     uint32_t serial;
+     BOOL processed;
++    BOOL activated;
+ };
+ 
+ struct wayland_window_config
+@@ -361,6 +362,7 @@ struct wayland_surface
+     struct wayland_window_config window;
+     int content_width, content_height;
+     HCURSOR hcursor;
++    BOOL xdg_minimized;       /* we asked the compositor to minimize the xdg_toplevel */
+     BOOL hide_deferred;       /* hidden while a pointer button was down on it: shown transparent until the release */
+     POINT dnd_icon_offset;    /* a drag's image: its move from where it is, for its next buffer */
+     BOOL dnd_icon_offset_pending;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 0056865..98fd135 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -242,6 +242,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     }
+     if ((surface = data->wayland_surface)) surface->hide_deferred = FALSE;
+ 
++    /* xdg_toplevel has no request to unminimize: one the program restores (from its tray icon,
++     * Battle.net) while the compositor keeps it minimized is shown again as a new one */
++    if (visible && surface && surface->xdg_minimized && wayland_surface_is_toplevel(surface) &&
++        !(NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_MINIMIZE))
++    {
++        TRACE("hwnd=%p restored while minimized by the compositor\n", data->hwnd);
++        wayland_surface_clear_role(surface);
++    }
++
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+     else if (!data->managed && wayland_pointer_drag_wanted(data->hwnd)) role = WAYLAND_SURFACE_ROLE_DND_ICON;
+     else if (!data->managed && is_popup(data->hwnd, owner_surface, &popup_input)) role = WAYLAND_SURFACE_ROLE_POPUP;
+@@ -356,6 +365,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+         if (surface->window.minimized)
+         {
+             xdg_toplevel_set_minimized(surface->xdg_toplevel);
++            surface->xdg_minimized = TRUE;
+         }
+     }
+     else
+@@ -737,12 +747,16 @@ static void wayland_configure_window(HWND hwnd)
+      * Win32 runs the full restore sequence (clearing WS_MINIMIZE, restoring
+      * position/size, sending WM_SIZE, etc.), which triggers a new configure
+      * cycle. */
++    /* Only one that activates it: KWin configures a window it has just minimized too (it lost the
++     * focus), and taking that for a restore left it minimized on the screen and restored for the
++     * program, which could not show it again (Battle.net from its tray icon). */
+     restoring_from_minimize = surface->window.rect.left <= -32000 &&
+                               surface->window.rect.top  <= -32000 &&
+-                              surface->window.minimized;
++                              surface->window.minimized && surface->processing.activated;
+     if (restoring_from_minimize)
+     {
+         TRACE("hwnd=%p restoring from minimize\n", hwnd);
++        surface->xdg_minimized = FALSE;
+         surface->current = surface->processing;
+         memset(&surface->processing, 0, sizeof(surface->processing));
+         xdg_surface_ack_configure(surface->xdg_surface,

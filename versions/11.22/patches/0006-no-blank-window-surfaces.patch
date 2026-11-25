@@ -29,7 +29,7 @@ background of the application makes such moments much less visible (Unreal Engin
 Without the variable nothing changes. An experiment.
 
 diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
-index 67d3dc8..bb03d9a 100755
+index 67d3dc8..bb03d9a 100644
 --- a/dlls/win32u/dce.c
 +++ b/dlls/win32u/dce.c
 @@ -552,6 +552,29 @@ static void *window_surface_get_color( struct window_surface *surface, BITMAPINF
@@ -89,7 +89,7 @@ index 67d3dc8..bb03d9a 100755
      OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
      OffsetRect( &dst, -window_rect->left, -window_rect->top );
 diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
-index 8a72d97..c2105a3 100755
+index 8a72d97..c2105a3 100644
 --- a/dlls/win32u/dibdrv/dc.c
 +++ b/dlls/win32u/dibdrv/dc.c
 @@ -533,6 +533,9 @@ static inline void unlock_surface( struct windrv_physdev *dev )
@@ -103,7 +103,7 @@ index 8a72d97..c2105a3 100755
          if (ticks > FLUSH_PERIOD) window_surface_flush( dev->surface );
      }
 diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
-index 4f0610c..fa7fce1 100755
+index 4f0610c..fa7fce1 100644
 --- a/dlls/win32u/window.c
 +++ b/dlls/win32u/window.c
 @@ -2537,6 +2537,14 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
@@ -122,7 +122,7 @@ index 4f0610c..fa7fce1 100755
      else
      {
 diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
-index e715840..a1b1587 100755
+index e715840..a1b1587 100644
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
 @@ -1568,6 +1568,28 @@ static const struct wl_buffer_listener dummy_buffer_listener =
@@ -168,7 +168,7 @@ index e715840..a1b1587 100755
      if (!(damage = NtGdiCreateRectRgn(0, 0, width, height)))
          WARN("Failed to create damage region for dummy buffer\n");
 diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
-index 239500b..6ccfbac 100755
+index 239500b..6ccfbac 100644
 --- a/dlls/winex11.drv/window.c
 +++ b/dlls/winex11.drv/window.c
 @@ -511,6 +511,28 @@ static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD st
@@ -222,7 +222,7 @@ index 239500b..6ccfbac 100755
  }
  
 diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
-index a66b7aa..cf38096 100755
+index a66b7aa..cf38096 100644
 --- a/include/wine/gdi_driver.h
 +++ b/include/wine/gdi_driver.h
 @@ -328,6 +328,7 @@ struct window_surface

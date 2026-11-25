@@ -1,0 +1,637 @@
+From: Wine Fox
+Subject: [PATCH] win32u, explorer, winex11, winewayland: Tray icons in the desktop's tray under X11 too.
+
+Under X11 the icons went into the desktop's tray over XEMBED: KDE Plasma shows them through
+xembedsniproxy, which copies the icon's window, black until it was drawn again (a click) and
+blurry when scaled.
+
+The StatusNotifierItem tray of winewayland moves to win32u (sni.c), for every driver: when the
+session bus has a StatusNotifierWatcher, the icons are items of it under X11 too, with the
+pixels of the icon (read with GetDIBits, the alpha of the mask when it has none). explorer
+serves the items on a thread of its own (WINE_SYSTRAY_SNI_SERVE); without D-Bus or a watcher
+it returns at once and the icons are docked as before. The new driver entry SystrayClickPos
+gives where a click on the tray is in Wine's coordinates, for the cursor that programs open
+their menu at: winewayland from the outputs' logical places, winex11 from the root window's
+(the pointer is warped there, which Xwayland does not know out of its windows).
+
+diff --git a/dlls/win32u/Makefile.in b/dlls/win32u/Makefile.in
+index 454fb25..f1e2e13 100644
+--- a/dlls/win32u/Makefile.in
++++ b/dlls/win32u/Makefile.in
+@@ -3,7 +3,7 @@ MODULE    = win32u.dll
+ UNIXLIB   = win32u.so
+ IMPORTLIB = win32u
+ IMPORTS   = ntdll
+-UNIX_CFLAGS  = $(FREETYPE_CFLAGS) $(FONTCONFIG_CFLAGS)
++UNIX_CFLAGS  = $(DBUS_CFLAGS) $(FREETYPE_CFLAGS) $(FONTCONFIG_CFLAGS)
+ UNIX_LIBS    = $(CORETEXT_LIBS) $(APPKIT_LIBS) $(PTHREAD_LIBS) -lm
+ 
+ EXTRADLLFLAGS = -nodefaultlibs
+@@ -51,6 +51,7 @@ SOURCES = \
+ 	spy.c \
+ 	syscall.c \
+ 	sysparams.c \
++	sni.c \
+ 	systray.c \
+ 	vertical.c \
+ 	vulkan.c \
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 0328cd5..9181d98 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -738,6 +738,11 @@ static BOOL nulldrv_SystrayDockRemove( HWND hwnd )
+     return FALSE;
+ }
+ 
++static BOOL nulldrv_SystrayClickPos( POINT *pt )
++{
++    return TRUE;
++}
++
+ static void nulldrv_UpdateClipboard(void)
+ {
+ }
+@@ -1197,6 +1202,11 @@ static BOOL loaderdrv_SystrayDockRemove( HWND hwnd )
+     return load_driver()->pSystrayDockRemove( hwnd );
+ }
+ 
++static BOOL loaderdrv_SystrayClickPos( POINT *pt )
++{
++    return load_driver()->pSystrayClickPos( pt );
++}
++
+ static LRESULT nulldrv_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+     return 0;
+@@ -1299,6 +1309,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     loaderdrv_SystrayDockInsert,
+     loaderdrv_SystrayDockClear,
+     loaderdrv_SystrayDockRemove,
++    loaderdrv_SystrayClickPos,
+     /* clipboard functions */
+     nulldrv_ClipboardWindowProc,
+     loaderdrv_UpdateClipboard,
+@@ -1402,6 +1413,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(SystrayDockInsert);
+     SET_USER_FUNC(SystrayDockClear);
+     SET_USER_FUNC(SystrayDockRemove);
++    SET_USER_FUNC(SystrayClickPos);
+     SET_USER_FUNC(ClipboardWindowProc);
+     SET_USER_FUNC(UpdateClipboard);
+     SET_USER_FUNC(ChangeDisplaySettings);
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 3a9dfa2..d011cb1 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -214,6 +214,11 @@ extern UINT get_send_message_flags(void);
+ /* systray.c */
+ extern LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *data );
+ 
++/* sni.c */
++extern LRESULT sni_notify_icon( HWND hwnd, UINT msg, NOTIFYICONDATAW *data );
++extern void sni_cleanup_icons( HWND hwnd );
++extern LRESULT sni_serve(void);
++
+ /* opengl.c */
+ extern BOOL set_dc_pixel_format_internal( HDC hdc, int format, struct list *drawables );
+ extern void release_opengl_drawables( struct list *drawables );
+diff --git a/dlls/winewayland.drv/systray.c b/dlls/win32u/sni.c
+similarity index 86%
+rename from dlls/winewayland.drv/systray.c
+rename to dlls/win32u/sni.c
+index e021895..47e5ba1 100755
+--- a/dlls/winewayland.drv/systray.c
++++ b/dlls/win32u/sni.c
+@@ -1,5 +1,5 @@
+ /*
+- * Wayland driver system tray: StatusNotifierItem over D-Bus
++ * System tray icons in the desktop's tray: StatusNotifierItem over D-Bus
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -34,7 +34,8 @@
+ #endif
+ 
+ #include "ntstatus.h"
+-#include "waylanddrv.h"
++#include "win32u_private.h"
++#include "ntuser_private.h"
+ #include "shellapi.h"
+ #include "wine/debug.h"
+ 
+@@ -137,6 +138,8 @@ static pthread_mutex_t tray_lock = PTHREAD_MUTEX_INITIALIZER;
+ static int wake_pipe[2] = {-1, -1};
+ static unsigned int icon_serial;
+ 
++static BOOL sni_init(void);
++
+ static void wake_dispatch(void)
+ {
+     char c = 0;
+@@ -151,47 +154,61 @@ static void wchar_to_utf8(const WCHAR *src, size_t src_len, char *dst, size_t ds
+     dst[len] = 0;
+ }
+ 
++/* the pixels of the icon's colour bitmap, with the alpha of its mask when it has none */
+ static void set_icon_pixels(struct tray_icon *icon, HICON hicon)
+ {
+-    ICONINFO info;
+-    struct wayland_shm_buffer *buf = NULL;
++    BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER), .biPlanes = 1, .biBitCount = 32}};
++    uint32_t *color = NULL, *mask = NULL;
++    ICONINFO icon_info;
++    BOOL alpha = FALSE;
++    BITMAP bm;
+     HDC hdc;
+-    int i;
++    int i, count;
+ 
+     free(icon->pixels);
+     icon->pixels = NULL;
+     icon->width = icon->height = 0;
+ 
+-    if (!hicon || !NtUserGetIconInfo(hicon, &info, NULL, NULL, NULL, 0)) return;
++    if (!hicon || !NtUserGetIconInfo(hicon, &icon_info, NULL, NULL, NULL, 0)) return;
+     /* shortcut: monochrome icons (no color bitmap) get no pixmap, convert the mask if an app needs it */
+-    if (info.hbmColor)
++    if (icon_info.hbmColor && NtGdiExtGetObjectW(icon_info.hbmColor, sizeof(bm), &bm) &&
++        bm.bmWidth > 0 && bm.bmHeight > 0)
+     {
++        count = bm.bmWidth * bm.bmHeight;
++        info.bmiHeader.biWidth = bm.bmWidth;
++        info.bmiHeader.biHeight = -bm.bmHeight;
+         hdc = NtGdiCreateCompatibleDC(0);
+-        buf = wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask, FALSE);
+-        NtGdiDeleteObjectApp(hdc);
+-        NtGdiDeleteObjectApp(info.hbmColor);
+-    }
+-    if (info.hbmMask) NtGdiDeleteObjectApp(info.hbmMask);
+-    if (!buf) return;
+-
+-    if ((icon->pixels = malloc(buf->width * buf->height * 4)))
+-    {
+-        const uint32_t *src = buf->map_data;
+-        unsigned char *dst = icon->pixels;
+-
+-        icon->width = buf->width;
+-        icon->height = buf->height;
+-        for (i = 0; i < buf->width * buf->height; i++, dst += 4)
++        if ((color = malloc(count * 4)) && (mask = malloc(count * 4)) &&
++            NtGdiGetDIBitsInternal(hdc, icon_info.hbmColor, 0, bm.bmHeight, color, &info, DIB_RGB_COLORS, 0, 0) &&
++            (icon->pixels = malloc(count * 4)))
+         {
+-            /* the shm buffer is premultiplied, SNI wants straight alpha */
+-            unsigned int a = src[i] >> 24;
+-            dst[0] = a;
+-            dst[1] = a ? ((src[i] >> 16) & 0xff) * 255 / a : 0;
+-            dst[2] = a ? ((src[i] >> 8) & 0xff) * 255 / a : 0;
+-            dst[3] = a ? (src[i] & 0xff) * 255 / a : 0;
++            for (i = 0; i < count && !alpha; i++) alpha = !!(color[i] >> 24);
++            if (!alpha)
++            {
++                info.bmiHeader.biBitCount = 32;
++                if (!icon_info.hbmMask ||
++                    !NtGdiGetDIBitsInternal(hdc, icon_info.hbmMask, 0, bm.bmHeight, mask, &info, DIB_RGB_COLORS, 0, 0))
++                    memset(mask, 0, count * 4);
++                /* a set mask bit is transparent */
++                for (i = 0; i < count; i++) color[i] = (color[i] & 0xffffff) | ((mask[i] & 0xffffff) ? 0 : 0xff000000);
++            }
++            /* ARGB32 in network byte order, straight alpha as icons have it */
++            for (i = 0; i < count; i++)
++            {
++                icon->pixels[i * 4] = color[i] >> 24;
++                icon->pixels[i * 4 + 1] = color[i] >> 16;
++                icon->pixels[i * 4 + 2] = color[i] >> 8;
++                icon->pixels[i * 4 + 3] = color[i];
++            }
++            icon->width = bm.bmWidth;
++            icon->height = bm.bmHeight;
+         }
++        NtGdiDeleteObjectApp(hdc);
++        free(color);
++        free(mask);
+     }
+-    wayland_shm_buffer_unref(buf);
++    if (icon_info.hbmColor) NtGdiDeleteObjectApp(icon_info.hbmColor);
++    if (icon_info.hbmMask) NtGdiDeleteObjectApp(icon_info.hbmMask);
+ }
+ 
+ static void append_pixmap(DBusMessageIter *iter, struct tray_icon *icon)
+@@ -315,11 +332,18 @@ static void notify_click(struct tray_icon *icon, DBusMessage *msg, UINT down, BO
+     UINT up = down + 1;
+     dbus_int32_t x, y;
+ 
+-    /* where the tray was clicked: Wine does not know where the pointer is out of its windows, and
+-     * programs open their menu at the cursor (it was at 0,0, under a top panel) */
++    POINT pt;
++
++    /* where the tray was clicked: programs open their menu at the cursor, and Wine does not know
++     * where the pointer is out of its windows under Wayland (it was at 0,0, under a top panel);
++     * the driver says where that is in Wine's coordinates */
+     if (p_dbus_message_get_args(msg, NULL, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INVALID) &&
+         (x || y))
+-        NtUserSetCursorPos(x, y);
++    {
++        pt.x = x;
++        pt.y = y;
++        if (user_driver->pSystrayClickPos(&pt)) NtUserSetCursorPos(pt.x, pt.y);
++    }
+ 
+     notify_owner(icon, down);
+     notify_owner(icon, up);
+@@ -517,12 +541,12 @@ fallback:
+     return -1;
+ }
+ 
+-LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data)
++LRESULT sni_notify_icon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data)
+ {
+     struct tray_icon *icon;
+     LRESULT ret = -1;
+ 
+-    if (wake_pipe[0] == -1) return -1;
++    if (!sni_init()) return -1;
+ 
+     pthread_mutex_lock(&tray_lock);
+     icon = get_icon(data->hWnd, data->uID);
+@@ -549,7 +573,7 @@ LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data)
+     return ret;
+ }
+ 
+-void WAYLAND_CleanupIcons(HWND hwnd)
++void sni_cleanup_icons(HWND hwnd)
+ {
+     struct tray_icon *icon, *next;
+ 
+@@ -561,33 +585,40 @@ void WAYLAND_CleanupIcons(HWND hwnd)
+     wake_dispatch();
+ }
+ 
+-/* only explorer owns the tray; other processes never get a dispatch thread */
+-NTSTATUS wayland_systray_init(void *arg)
++static pthread_once_t init_once = PTHREAD_ONCE_INIT;
++
++static void init_dbus(void)
+ {
+     void *handle;
+ 
+-    if (!process_name || strcmp(process_name, "explorer.exe")) return STATUS_NOT_SUPPORTED;
+     if (!(handle = dlopen(SONAME_LIBDBUS_1, RTLD_NOW))) goto failed;
+ #define DO_FUNC(f) if (!(p_##f = dlsym(handle, #f))) goto failed
+     DBUS_FUNCS;
+ #undef DO_FUNC
+     p_dbus_threads_init_default();
+-    if (pipe2(wake_pipe, O_CLOEXEC | O_NONBLOCK)) return STATUS_UNSUCCESSFUL;
+-    return STATUS_SUCCESS;
++    if (pipe2(wake_pipe, O_CLOEXEC | O_NONBLOCK)) wake_pipe[0] = wake_pipe[1] = -1;
++    return;
+ 
+ failed:
+     WARN("failed to load D-Bus support: %s\n", dlerror());
+-    return STATUS_NOT_SUPPORTED;
++}
++
++/* only explorer, which owns the tray, calls these */
++static BOOL sni_init(void)
++{
++    pthread_once(&init_once, init_dbus);
++    return wake_pipe[0] != -1;
+ }
+ 
+ /* runs on a dedicated Wine thread, so handlers may send window messages */
+-NTSTATUS wayland_systray_dispatch(void *arg)
++LRESULT sni_serve(void)
+ {
+     struct pollfd *fds = NULL;
+     struct tray_icon *icon;
+     unsigned int count, i;
+     char buf[64];
+ 
++    if (!sni_init()) return -1;
+     for (;;)
+     {
+         pthread_mutex_lock(&tray_lock);
+@@ -615,28 +646,23 @@ NTSTATUS wayland_systray_dispatch(void *arg)
+         }
+         pthread_mutex_unlock(&tray_lock);
+     }
+-    return STATUS_SUCCESS;
++    return 0;
+ }
+ 
+ #else /* SONAME_LIBDBUS_1 */
+ 
+-LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data)
++LRESULT sni_notify_icon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data)
+ {
+     return -1;
+ }
+ 
+-void WAYLAND_CleanupIcons(HWND hwnd)
++void sni_cleanup_icons(HWND hwnd)
+ {
+ }
+ 
+-NTSTATUS wayland_systray_init(void *arg)
++LRESULT sni_serve(void)
+ {
+-    return STATUS_NOT_SUPPORTED;
+-}
+-
+-NTSTATUS wayland_systray_dispatch(void *arg)
+-{
+-    return STATUS_NOT_SUPPORTED;
++    return -1;
+ }
+ 
+ #endif /* SONAME_LIBDBUS_1 */
+diff --git a/dlls/win32u/systray.c b/dlls/win32u/systray.c
+index 4a99524..15dd6d4 100644
+--- a/dlls/win32u/systray.c
++++ b/dlls/win32u/systray.c
+@@ -35,10 +35,18 @@ LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, voi
+     switch (msg)
+     {
+     case WINE_SYSTRAY_NOTIFY_ICON:
++    {
++        /* in the desktop's tray (StatusNotifierItem) when it has one, under any driver */
++        LRESULT ret = sni_notify_icon( hwnd, wparam, data );
++        if (ret != -1) return ret;
+         return user_driver->pNotifyIcon( hwnd, wparam, data );
++    }
+     case WINE_SYSTRAY_CLEANUP_ICONS:
++        sni_cleanup_icons( hwnd );
+         user_driver->pCleanupIcons( hwnd );
+         return 0;
++    case WINE_SYSTRAY_SNI_SERVE:
++        return sni_serve();
+ 
+     case WINE_SYSTRAY_DOCK_INIT:
+         user_driver->pSystrayDockInit( hwnd );
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index b40c453..34d6d5c 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE = winewayland.drv
+ UNIXLIB = winewayland.so
+-UNIX_CFLAGS = $(DBUS_CFLAGS) $(EGL_CFLAGS) $(WAYLAND_CLIENT_CFLAGS) $(WAYLAND_EGL_CFLAGS) $(XKBCOMMON_CFLAGS) $(XKBREGISTRY_CFLAGS)
++UNIX_CFLAGS = $(EGL_CFLAGS) $(WAYLAND_CLIENT_CFLAGS) $(WAYLAND_EGL_CFLAGS) $(XKBCOMMON_CFLAGS) $(XKBREGISTRY_CFLAGS)
+ UNIX_LIBS = -lwin32u $(WAYLAND_CLIENT_LIBS) $(WAYLAND_EGL_LIBS) $(XKBCOMMON_LIBS) $(XKBREGISTRY_LIBS) $(PTHREAD_LIBS) -lm
+ IMPORTS = user32 win32u
+ 
+@@ -16,7 +16,6 @@ SOURCES = \
+ 	opengl.c \
+ 	pointer-constraints-unstable-v1.xml \
+ 	pointer-warp-v1.xml \
+-	systray.c \
+ 	relative-pointer-unstable-v1.xml \
+ 	text-input-unstable-v3.xml \
+ 	viewporter.xml \
+diff --git a/dlls/winewayland.drv/dllmain.c b/dlls/winewayland.drv/dllmain.c
+index 4c5583f..8055d88 100644
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -38,12 +38,6 @@ static DWORD WINAPI wayland_read_events_thread(void *arg)
+     return 0;
+ }
+ 
+-static DWORD WINAPI systray_thread(void *arg)
+-{
+-    WAYLANDDRV_UNIX_CALL(systray_dispatch, NULL);
+-    return 0;
+-}
+-
+ static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg)
+@@ -116,9 +110,6 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+     /* Handle clipboard events in a dedicated thread, if needed. */
+     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
+         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));
+-    /* Serve StatusNotifierItem tray icons in explorer, if D-Bus is available. */
+-    if (!WAYLANDDRV_UNIX_CALL(systray_init, NULL))
+-        CloseHandle(CreateThread(NULL, 0, systray_thread, NULL, 0, &tid));
+ 
+     return TRUE;
+ }
+diff --git a/dlls/winewayland.drv/unixlib.h b/dlls/winewayland.drv/unixlib.h
+index b6927fb..d9378fe 100644
+--- a/dlls/winewayland.drv/unixlib.h
++++ b/dlls/winewayland.drv/unixlib.h
+@@ -28,8 +28,6 @@ enum waylanddrv_unix_func
+     waylanddrv_unix_func_init,
+     waylanddrv_unix_func_read_events,
+     waylanddrv_unix_func_init_clipboard,
+-    waylanddrv_unix_func_systray_init,
+-    waylanddrv_unix_func_systray_dispatch,
+     waylanddrv_unix_func_count,
+ };
+ 
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+index 6664a3f..f0cdebb 100644
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -437,3 +437,37 @@ struct wl_output *wayland_output_at(int x, int y, POINT *pos)
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+     return ret;
+ }
++
++/**********************************************************************
++ *          WAYLAND_SystrayClickPos
++ *
++ * Where a click on the desktop's tray (StatusNotifierItem's Activate, in the compositor's
++ * logical coordinates) is in Wine's: Wine does not know where the pointer is out of its
++ * windows, programs open their menu at the cursor. The other way from wayland_output_at.
++ */
++BOOL WAYLAND_SystrayClickPos(POINT *pt)
++{
++    struct wayland_output *output, *primary = NULL;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        struct wayland_output_state *state = &output->current;
++        int width, height, logical_w, logical_h;
++
++        if (!state->current_mode) continue;
++        if (!primary) primary = output;
++        width = wayland_output_mode_width(state, state->current_mode);
++        height = wayland_output_mode_height(state, state->current_mode);
++        logical_w = state->logical_w > 0 ? state->logical_w : width;
++        logical_h = state->logical_h > 0 ? state->logical_h : height;
++        if (pt->x < state->logical_x || pt->y < state->logical_y ||
++            pt->x >= state->logical_x + logical_w || pt->y >= state->logical_y + logical_h)
++            continue;
++        pt->x = state->logical_x - primary->current.logical_x + (pt->x - state->logical_x) * width / logical_w;
++        pt->y = state->logical_y - primary->current.logical_y + (pt->y - state->logical_y) * height / logical_h;
++        break;
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    return TRUE;
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 0c1d94c..f51e904 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -570,10 +570,7 @@ void wayland_data_source_init_drag(struct wl_data_source *source);
+ void wayland_surface_attach_transparent(struct wayland_surface *surface);
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface);
+-LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data);
+-void WAYLAND_CleanupIcons(HWND hwnd);
+-NTSTATUS wayland_systray_init(void *arg);
+-NTSTATUS wayland_systray_dispatch(void *arg);
++BOOL WAYLAND_SystrayClickPos(POINT *pt);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+ struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format, BOOL raw);
+ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 28355bb..3fbb5d7 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -39,17 +39,16 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .dc_funcs.pExtEscape = WAYLAND_ExtEscape,
+     .dc_funcs.priority = GDI_PRIORITY_GRAPHICS_DRV,
+     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
+-    .pCleanupIcons = WAYLAND_CleanupIcons,
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pDestroyWindow = WAYLAND_DestroyWindow,
+     .pSetIMECompositionRect = WAYLAND_SetIMECompositionRect,
+     .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
+-    .pNotifyIcon = WAYLAND_NotifyIcon,
+     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
+     .pSetCursor = WAYLAND_SetCursor,
+     .pSetCursorPos = WAYLAND_SetCursorPos,
++    .pSystrayClickPos = WAYLAND_SystrayClickPos,
+     .pSetLayeredWindowAttributes = WAYLAND_SetLayeredWindowAttributes,
+     .pSetWindowIcons = WAYLAND_SetWindowIcons,
+     .pSetWindowStyle = WAYLAND_SetWindowStyle,
+@@ -140,8 +139,6 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
+-    wayland_systray_init,
+-    wayland_systray_dispatch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
+@@ -153,8 +150,6 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
+-    wayland_systray_init,
+-    wayland_systray_dispatch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 919195e..6ef4372 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -701,6 +701,7 @@ static const struct user_driver_funcs x11drv_funcs =
+     .pSystrayDockInsert = X11DRV_SystrayDockInsert,
+     .pSystrayDockClear = X11DRV_SystrayDockClear,
+     .pSystrayDockRemove = X11DRV_SystrayDockRemove,
++    .pSystrayClickPos = X11DRV_SystrayClickPos,
+     .pChangeDisplaySettings = X11DRV_ChangeDisplaySettings,
+     .pUpdateDisplayDevices = X11DRV_UpdateDisplayDevices,
+     .pCreateDesktop = X11DRV_CreateDesktop,
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index ab4ff9a..700b44a 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -2935,6 +2935,19 @@ static struct x11drv_win_data *X11DRV_create_win_data( HWND hwnd, const struct w
+ }
+ 
+ 
++/***********************************************************************
++ *              SystrayClickPos   (X11DRV.@)
++ *
++ * The desktop's tray was clicked at a point of the root window. The X pointer is there already
++ * on an X server; Xwayland does not know where the pointer is out of its windows, and the warp
++ * puts it there for the programs that read it.
++ */
++BOOL X11DRV_SystrayClickPos( POINT *pt )
++{
++    *pt = root_to_virtual_screen( pt->x, pt->y );
++    return TRUE;
++}
++
+ /***********************************************************************
+  *              SystrayDockInit   (X11DRV.@)
+  */
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 3b094c4..30d322d 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -219,6 +219,7 @@ extern BOOL X11DRV_SetCursorPos( INT x, INT y );
+ extern BOOL X11DRV_GetCursorPos( LPPOINT pos );
+ extern BOOL X11DRV_ClipCursor( const RECT *clip, BOOL reset );
+ extern void X11DRV_SystrayDockInit( HWND systray );
++extern BOOL X11DRV_SystrayClickPos( POINT *pt );
+ extern BOOL X11DRV_SystrayDockInsert( HWND owner, UINT cx, UINT cy, void *icon );
+ extern void X11DRV_SystrayDockClear( HWND hwnd );
+ extern BOOL X11DRV_SystrayDockRemove( HWND hwnd );
+diff --git a/include/ntuser.h b/include/ntuser.h
+index eba73d6..60d2473 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -699,6 +699,7 @@ enum wine_systray_call
+     WINE_SYSTRAY_DOCK_INSERT,
+     WINE_SYSTRAY_DOCK_CLEAR,
+     WINE_SYSTRAY_DOCK_REMOVE,
++    WINE_SYSTRAY_SNI_SERVE,
+ };
+ 
+ /* NtUserDragDropCall calls */
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index cf38096..8ee9f76 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -224,7 +224,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 110
++#define WINE_GDI_DRIVER_VERSION 111
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -405,6 +405,7 @@ struct user_driver_funcs
+     BOOL    (*pSystrayDockInsert)(HWND,UINT,UINT,void *);
+     void    (*pSystrayDockClear)(HWND);
+     BOOL    (*pSystrayDockRemove)(HWND);
++    BOOL    (*pSystrayClickPos)(POINT *);
+     /* clipboard functions */
+     LRESULT (*pClipboardWindowProc)(HWND,UINT,WPARAM,LPARAM);
+     void    (*pUpdateClipboard)(void);
+diff --git a/programs/explorer/systray.c b/programs/explorer/systray.c
+index d662f21..05ffc41 100644
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -799,6 +799,13 @@ static void cleanup_systray_window( HWND hwnd )
+     NtUserMessageCall( hwnd, WINE_SYSTRAY_CLEANUP_ICONS, 0, 0, NULL, NtUserSystemTrayCall, FALSE );
+ }
+ 
++/* serves the icons shown in the desktop's tray, returns at once when there is none */
++static DWORD WINAPI sni_thread( void *arg )
++{
++    NtUserMessageCall( tray_window, WINE_SYSTRAY_SNI_SERVE, 0, 0, NULL, NtUserSystemTrayCall, FALSE );
++    return 0;
++}
++
+ /* update the taskbar buttons when something changed */
+ static void sync_taskbar_buttons(void)
+ {
+@@ -1269,6 +1276,8 @@ void initialize_systray( BOOL arg_using_root, BOOL arg_enable_shell, BOOL arg_sh
+         ERR( "Could not create tray window\n" );
+         return;
+     }
++    /* icons in the desktop's tray (StatusNotifierItem) are served there */
++    CloseHandle( CreateThread( NULL, 0, sni_thread, NULL, 0, NULL ));
+ 
+     LoadStringW( NULL, IDS_START_LABEL, start_label, ARRAY_SIZE( start_label ));
+ 

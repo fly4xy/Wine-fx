@@ -76,7 +76,7 @@ Windows of one process are as before.
 Shown with a test of two processes under winex11 (WM_WINE_SETCURSOR reaches the child's process).
 
 diff --git a/dlls/dcomp/Makefile.in b/dlls/dcomp/Makefile.in
-index 3c14125..e63b43f 100755
+index 3c14125..e63b43f 100644
 --- a/dlls/dcomp/Makefile.in
 +++ b/dlls/dcomp/Makefile.in
 @@ -1,4 +1,5 @@
@@ -86,7 +86,7 @@ index 3c14125..e63b43f 100755
  VER_PRODUCTVERSION = 10,0,14393,0
  
 diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
-index 2744d75..6fdd1af 100755
+index 2744d75..6fdd1af 100644
 --- a/dlls/dcomp/device.c
 +++ b/dlls/dcomp/device.c
 @@ -17,19 +17,462 @@
@@ -557,7 +557,7 @@ index 2744d75..6fdd1af 100755
  
  HRESULT WINAPI DCompositionCreateDevice2(IUnknown *rendering_device, REFIID iid, void **device)
 diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
-index 6ecd575..7e2b8f5 100755
+index 6ecd575..7e2b8f5 100644
 --- a/dlls/dxgi/dxgi_private.h
 +++ b/dlls/dxgi/dxgi_private.h
 @@ -186,6 +186,15 @@ struct d3d11_swapchain
@@ -577,7 +577,7 @@ index 6ecd575..7e2b8f5 100755
  
  HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
 diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
-index c6bb47f..0b6d6d3 100755
+index c6bb47f..0b6d6d3 100644
 --- a/dlls/dxgi/factory.c
 +++ b/dlls/dxgi/factory.c
 @@ -390,10 +390,31 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
@@ -615,7 +615,7 @@ index c6bb47f..0b6d6d3 100755
  
  static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
 diff --git a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
-index 283c18d..a64fd01 100755
+index 283c18d..a64fd01 100644
 --- a/dlls/dxgi/swapchain.c
 +++ b/dlls/dxgi/swapchain.c
 @@ -18,6 +18,7 @@
@@ -879,7 +879,7 @@ index 283c18d..a64fd01 100755
      if (hr == WINED3DOK_PRESENT_OCCLUDED)
          return DXGI_STATUS_OCCLUDED;
 diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
-index bb03d9a..44d723c 100755
+index bb03d9a..44d723c 100644
 --- a/dlls/win32u/dce.c
 +++ b/dlls/win32u/dce.c
 @@ -912,6 +912,44 @@ static void update_visible_region( struct dce *dce )
@@ -928,7 +928,7 @@ index bb03d9a..44d723c 100755
   *           release_dce
   */
 diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
-index de1a484..cbb9a17 100755
+index de1a484..cbb9a17 100644
 --- a/dlls/win32u/message.c
 +++ b/dlls/win32u/message.c
 @@ -2274,6 +2274,10 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
@@ -943,7 +943,7 @@ index de1a484..cbb9a17 100755
      {
          TRACKMOUSEEVENT info;
 diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
-index 4f3eea7..d8c2fe1 100755
+index 4f3eea7..d8c2fe1 100644
 --- a/dlls/win32u/win32u_private.h
 +++ b/dlls/win32u/win32u_private.h
 @@ -247,6 +247,10 @@ extern NTSTATUS d3dkmt_swapchain_destroy_remote( D3DKMT_HANDLE local );
@@ -958,10 +958,10 @@ index 4f3eea7..d8c2fe1 100755
  
  extern BOOL get_opengl_gpus( struct list *gpus );
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
-index 5eae215..75115e4 100755
+index 5486634..93cd30d 100644
 --- a/dlls/winewayland.drv/wayland_pointer.c
 +++ b/dlls/winewayland.drv/wayland_pointer.c
-@@ -887,9 +887,10 @@ static enum wp_cursor_shape_device_v1_shape cursor_shape_from_info(ICONINFOEXW *
+@@ -858,9 +858,10 @@ static enum wp_cursor_shape_device_v1_shape cursor_shape_from_info(ICONINFOEXW *
      return shape;
  }
  
@@ -973,7 +973,7 @@ index 5eae215..75115e4 100755
      ICONINFOEXW info = {0};
      enum wp_cursor_shape_device_v1_shape shape = 0;
      uint32_t proto_version;
-@@ -904,7 +905,14 @@ static BOOL wayland_pointer_set_cursor_shape(HCURSOR hcursor)
+@@ -875,7 +876,14 @@ static BOOL wayland_pointer_set_cursor_shape(HCURSOR hcursor)
      if (info.hbmColor) NtGdiDeleteObjectApp(info.hbmColor);
      if (info.hbmMask) NtGdiDeleteObjectApp(info.hbmMask);
  
@@ -989,7 +989,7 @@ index 5eae215..75115e4 100755
  
      if (!pointer->wp_cursor_shape_device_v1)
      {
-@@ -938,6 +946,7 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+@@ -909,6 +917,7 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
      struct wayland_win_data *data;
      double scale;
      BOOL reapply_clip = FALSE;
@@ -997,7 +997,7 @@ index 5eae215..75115e4 100755
  
      if ((data = wayland_win_data_get(hwnd)))
      {
-@@ -947,8 +956,17 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+@@ -918,8 +927,17 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
              return;
          }
          scale = surface->window.scale;
@@ -1017,7 +1017,7 @@ index 5eae215..75115e4 100755
          use_hcursor = TRUE;
          wayland_win_data_release(data);
      }
-@@ -960,7 +978,8 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+@@ -931,7 +949,8 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
      pthread_mutex_lock(&pointer->mutex);
      if (pointer->focused_hwnd == hwnd)
      {
@@ -1027,7 +1027,7 @@ index 5eae215..75115e4 100755
              (use_hcursor && hcursor && wayland_pointer_set_cursor_shape(hcursor)))
          {
              wayland_pointer_clear_cursor_surface();
-@@ -1138,10 +1157,52 @@ void wayland_pointer_clear_constraint(void)
+@@ -1109,10 +1128,52 @@ void wayland_pointer_clear_constraint(void)
  /***********************************************************************
   *           WAYLAND_SetCursor
   */
@@ -1081,7 +1081,7 @@ index 5eae215..75115e4 100755
  }
  
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 4a04a9d..524e8bb 100755
+index 4a04a9d..524e8bb 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -75,6 +75,7 @@ enum wayland_window_message
@@ -1109,7 +1109,7 @@ index 4a04a9d..524e8bb 100755
  void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                const struct window_rects *new_rects, struct window_surface *surface);
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index 0655539..47364d1 100755
+index 0655539..47364d1 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -737,6 +737,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1123,10 +1123,10 @@ index 0655539..47364d1 100755
      {
          struct wayland_win_data *data;
 diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
-index 64f400d..6839fa2 100755
+index cb79ed5..fee3d1b 100644
 --- a/dlls/winex11.drv/mouse.c
 +++ b/dlls/winex11.drv/mouse.c
-@@ -1449,12 +1449,21 @@ void X11DRV_DestroyCursorIcon( HCURSOR handle )
+@@ -1414,12 +1414,21 @@ void X11DRV_DestroyCursorIcon( HCURSOR handle )
  void X11DRV_SetCursor( HWND hwnd, HCURSOR handle )
  {
      struct x11drv_win_data *data;
@@ -1149,7 +1149,7 @@ index 64f400d..6839fa2 100755
      if (clipping_cursor) set_window_cursor( x11drv_thread_data()->clip_window, handle );
  }
 diff --git a/include/ntuser.h b/include/ntuser.h
-index ad0eccb..eba73d6 100755
+index ad0eccb..eba73d6 100644
 --- a/include/ntuser.h
 +++ b/include/ntuser.h
 @@ -643,12 +643,23 @@ enum wine_internal_message
@@ -1177,7 +1177,7 @@ index ad0eccb..eba73d6 100755
  #define WM_IME_INTERNAL 0x287
  #define IME_INTERNAL_ACTIVATE   0x17
 diff --git a/include/wine/winedxgi.idl b/include/wine/winedxgi.idl
-index fff00de..3818acc 100755
+index fff00de..3818acc 100644
 --- a/include/wine/winedxgi.idl
 +++ b/include/wine/winedxgi.idl
 @@ -20,6 +20,10 @@
@@ -1192,7 +1192,7 @@ index fff00de..3818acc 100755
      object,
      local,
 diff --git a/server/queue.c b/server/queue.c
-index 2449f0c..76ab458 100755
+index 2449f0c..76ab458 100644
 --- a/server/queue.c
 +++ b/server/queue.c
 @@ -543,6 +543,7 @@ static int update_desktop_cursor_pos( struct desktop *desktop, user_handle_t win
@@ -1204,7 +1204,7 @@ index 2449f0c..76ab458 100755
  
      return updated;
 diff --git a/server/user.h b/server/user.h
-index f1a1f07..870dfab 100755
+index f1a1f07..870dfab 100644
 --- a/server/user.h
 +++ b/server/user.h
 @@ -182,6 +182,7 @@ extern int make_window_active( user_handle_t window );
@@ -1216,7 +1216,7 @@ index f1a1f07..870dfab 100755
  extern struct window_class *get_window_class( user_handle_t window );
  extern void set_window_rect_visible( user_handle_t window, struct rectangle rect );
 diff --git a/server/window.c b/server/window.c
-index 3cd82b0..a551c6c 100755
+index 3cd82b0..a551c6c 100644
 --- a/server/window.c
 +++ b/server/window.c
 @@ -1070,6 +1070,23 @@ struct thread *window_thread_from_point( user_handle_t scope, int x, int y )

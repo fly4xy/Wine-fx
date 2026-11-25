@@ -1,0 +1,146 @@
+From: Wine Fox
+Subject: [PATCH] winex11: A window hidden while a pointer button is down on it stays until the release.
+
+Unreal Engine hides its floating window whose last tab is dragged out, while the button is down
+on it. Under Xwayland the compositor keeps sending the pointer to the window the button went
+down on: unmapped, Wine got no pointer events until the button was up, the cursor stood still in
+Wine and the tab Unreal drags with it did not move (an invisible drag of the last tab, under
+KWin).
+
+Such a window now stays mapped until all the buttons are up, fully transparent and without
+input; then it is hidden, or made as it was if it was shown again meanwhile.
+
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index fee3d1b..2f8ace5 100644
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -1593,6 +1593,7 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
+         window_set_user_time( data, event->time, FALSE );
+         release_win_data( data );
+     }
++    window_button_press( hwnd );
+ 
+     pt = map_event_coords( hwnd, event->window, event->root, root, pt );
+     send_mouse_input( hwnd, pt, MOUSEEVENTF_ABSOLUTE | flags, button_down_data[button], time, NULL );
+@@ -1615,6 +1616,7 @@ BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *xev )
+ 
+     pt = map_event_coords( hwnd, event->window, event->root, root, pt );
+     send_mouse_input( hwnd, pt, MOUSEEVENTF_ABSOLUTE | flags, button_up_data[button], time, NULL );
++    window_button_release( event->state, event->button );
+     return TRUE;
+ }
+ 
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 40a1712..ab4ff9a 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -692,6 +692,9 @@ static void sync_window_region( struct x11drv_win_data *data, HRGN win_region )
+ }
+ 
+ 
++/* the window a pointer button went down on, while one is down */
++static HWND button_down_hwnd;
++
+ /***********************************************************************
+  *              sync_window_opacity
+  */
+@@ -3321,6 +3324,67 @@ static BOOL get_desired_wm_state( DWORD style, const struct window_rects *rects
+ /***********************************************************************
+  *		WindowPosChanged   (X11DRV.@)
+  */
++/* Undoes window_defer_hide: the window as it is again, and hidden if it still is. */
++static void window_end_deferred_hide( struct x11drv_win_data *data, UINT style )
++{
++    COLORREF key;
++    BYTE alpha;
++    DWORD flags;
++
++    if (!data->hide_deferred) return;
++    data->hide_deferred = FALSE;
++    TRACE( "win %p/%lx %s\n", data->hwnd, data->whole_window, (style & WS_VISIBLE) ? "shown again" : "hidden now" );
++    if (data->layered && NtUserGetLayeredWindowAttributes( data->hwnd, &key, &alpha, &flags ))
++        sync_window_opacity( data->display, data->whole_window, alpha, flags );
++    else
++        sync_window_opacity( data->display, data->whole_window, 0, 0 );
++    sync_window_input_shape( data );
++    if (!(style & WS_VISIBLE)) window_set_wm_state( data, WithdrawnState, FALSE );
++    XFlush( data->display );
++}
++
++/* Unreal Engine hides its floating window whose last tab is dragged out, while the button is down
++ * on it. Under Xwayland the compositor keeps sending the pointer to the window the button went down
++ * on: unmapped, Wine had no pointer events until the button was up (the cursor stood still, and
++ * the tab Unreal drags with it). Such a window stays mapped, transparent and without input, until
++ * the button is up. */
++static BOOL window_defer_hide( struct x11drv_win_data *data )
++{
++#ifdef HAVE_LIBXSHAPE
++    static XRectangle empty_rect;
++
++    if (data->hide_deferred) return TRUE;
++    if (data->hwnd != button_down_hwnd || data->desired_state.wm_state == WithdrawnState) return FALSE;
++    TRACE( "win %p/%lx hidden when the button is up\n", data->hwnd, data->whole_window );
++    data->hide_deferred = TRUE;
++    sync_window_opacity( data->display, data->whole_window, 0, LWA_ALPHA );
++    XShapeCombineRectangles( data->display, data->whole_window, ShapeInput, 0, 0, &empty_rect, 1, ShapeSet, YXBanded );
++    return TRUE;
++#else
++    return FALSE;
++#endif
++}
++
++void window_button_press( HWND hwnd )
++{
++    if (!button_down_hwnd) button_down_hwnd = hwnd;
++}
++
++/* state: the buttons down before this release */
++void window_button_release( unsigned int state, unsigned int button )
++{
++    static const unsigned int buttons = Button1Mask | Button2Mask | Button3Mask; /* not the wheel's */
++    struct x11drv_win_data *data;
++    HWND hwnd = button_down_hwnd;
++
++    if (button >= 1 && button <= 3) state &= ~(Button1Mask << (button - 1));
++    if (state & buttons) return;
++    button_down_hwnd = 0;
++    if (!hwnd || !(data = get_win_data( hwnd ))) return;
++    window_end_deferred_hide( data, NtUserGetWindowLongW( hwnd, GWL_STYLE ));
++    release_win_data( data );
++}
++
+ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface )
+ {
+@@ -3350,6 +3414,10 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+         WARN( "win %p/%lx not yet hidden, delaying unmapping\n", hwnd, data->whole_window );
+         new_style |= WS_VISIBLE;
+     }
++    else if (!(new_style & WS_VISIBLE) && data->whole_window && window_defer_hide( data ))
++        new_style |= WS_VISIBLE;
++    else if ((new_style & WS_VISIBLE) && data->hide_deferred)
++        window_end_deferred_hide( data, new_style );
+ 
+     /* layered windows are mapped only once their attributes are set */
+     if (data->desired_state.wm_state == WithdrawnState && (new_style & WS_VISIBLE) &&
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 16a5ad8..3b094c4 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -703,6 +703,7 @@ struct x11drv_win_data
+     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
+     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
+     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
++    UINT        hide_deferred : 1; /* hidden while a button is down on it: mapped, see window_defer_hide */
+     Window      embedder;       /* window id of embedder */
+     Pixmap         icon_pixmap;
+     Pixmap         icon_mask;
+@@ -730,6 +731,8 @@ extern Window X11DRV_get_whole_window( HWND hwnd );
+ extern Window get_dummy_parent(void);
+ 
+ extern BOOL window_is_reparenting( HWND hwnd );
++extern void window_button_press( HWND hwnd );
++extern void window_button_release( unsigned int state, unsigned int button );
+ extern BOOL window_should_take_focus( HWND hwnd, Time time );
+ extern BOOL window_has_pending_wm_state( HWND hwnd, UINT state );
+ extern void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial, UINT value, Time time );

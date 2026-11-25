@@ -13,7 +13,7 @@ drag at each motion, drop, leave. The answer of the drop target accepts or refus
 for the source; user32's patch 0002 gives late targets such as Unreal Engine a grace period.
 
 diff --git a/dlls/winewayland.drv/wayland_data_device.c b/dlls/winewayland.drv/wayland_data_device.c
-index 4683025..c080bd0 100755
+index 4683025..c080bd0 100644
 --- a/dlls/winewayland.drv/wayland_data_device.c
 +++ b/dlls/winewayland.drv/wayland_data_device.c
 @@ -28,6 +28,8 @@
@@ -415,7 +415,7 @@ index 4683025..c080bd0 100755
      else if (process_wayland.wl_data_device_manager)
      {
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 9ee1ad3..6fe1a51 100755
+index 9ee1ad3..6fe1a51 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -71,6 +71,7 @@ enum wayland_window_message
@@ -443,7 +443,7 @@ index 9ee1ad3..6fe1a51 100755
                                const struct window_rects *new_rects, struct window_surface *surface);
  BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index ddde1ed..09d6732 100755
+index ddde1ed..09d6732 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -626,6 +626,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)

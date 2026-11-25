@@ -1,0 +1,176 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: A window hidden while a pointer button is down on it stays until the release.
+
+Unreal Engine hides a floating window whose last tab is dragged out, while the button is down on
+it. The dragged tab (its cursor decorator, a subsurface of the window with the pointer) then went
+to another window, with its place still in the hidden window's coordinates: where a window the
+user moved is on the screen Wine does not know (Wayland), so the tab jumped to where Wine thought
+the floating window was. And with the window gone the compositor could end the pointer grab
+without the button release ever reaching the application.
+
+Such a window now stays mapped, transparent and without input, until the button is up: the tab
+keeps it as parent and its place right, the release comes to it, then it is hidden.
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 93cd30d..dd8b481 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -122,6 +122,19 @@ HWND wayland_pointer_get_focused_toplevel(void)
+     return hwnd ? NtUserGetAncestor(hwnd, GA_ROOT) : 0;
+ }
+ 
++/* whether a pointer button is down on the window: the compositor sends the pointer events to it
++ * until the release, wherever the pointer goes (implicit grab) */
++BOOL wayland_pointer_button_down_on(HWND hwnd)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    BOOL ret;
++
++    pthread_mutex_lock(&pointer->mutex);
++    ret = pointer->button_serial && pointer->focused_hwnd == hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++    return ret;
++}
++
+ static HWND wayland_pointer_get_focused_hwnd(void)
+ {
+     struct wayland_pointer *pointer = &process_wayland.pointer;
+@@ -401,6 +414,15 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
+ 
+     NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++
++    if (state == WL_POINTER_BUTTON_STATE_RELEASED)
++    {
++        struct wayland_win_data *data = wayland_win_data_get(hwnd);
++        BOOL deferred = data && data->wayland_surface && data->wayland_surface->hide_deferred;
++
++        if (data) wayland_win_data_release(data);
++        if (deferred) NtUserPostMessage(hwnd, WM_WAYLAND_DEFERRED_HIDE, 0, 0);
++    }
+ }
+ 
+ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 9781593..926c668 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1860,6 +1860,36 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface)
+     if (damage) NtGdiDeleteObjectApp(damage);
+ }
+ 
++/**********************************************************************
++ *          wayland_surface_attach_transparent
++ *
++ * Shows nothing on the surface and lets the pointer through, keeping it mapped.
++ */
++void wayland_surface_attach_transparent(struct wayland_surface *surface)
++{
++    struct wayland_shm_buffer *buffer;
++    struct wl_region *region;
++    HRGN damage;
++    int width = surface->window.rect.right - surface->window.rect.left;
++    int height = surface->window.rect.bottom - surface->window.rect.top;
++
++    if (width <= 0 || height <= 0) return;
++    if (!(buffer = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_ARGB8888))) return;
++    wl_buffer_add_listener(buffer->wl_buffer, &dummy_buffer_listener, buffer);
++    memset(buffer->map_data, 0, buffer->map_size);
++    damage = NtGdiCreateRectRgn(0, 0, width, height);
++    if ((region = wl_compositor_create_region(process_wayland.wl_compositor)))
++    {
++        wl_surface_set_input_region(surface->wl_surface, region);
++        wl_region_destroy(region);
++    }
++    wayland_surface_attach_shm(surface, buffer, damage);
++    wl_surface_commit(surface->wl_surface);
++    wayland_shm_buffer_unref(buffer);
++    if (damage) NtGdiDeleteObjectApp(damage);
++    wl_display_flush(process_wayland.wl_display);
++}
++
+ /**********************************************************************
+  *          wayland_surface_set_title
+  */
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index e3a0e03..ddd90d7 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -76,6 +76,7 @@ enum wayland_window_message
+     WM_WAYLAND_KEYBOARD_LEAVE, /* the window lost the keyboard focus */
+     WM_WAYLAND_ALIGN_WINDOW,   /* move the window by (wparam, lparam): where the compositor shows it */
+     WM_WAYLAND_REMOTE_CURSOR,  /* lparam: the cursor shape another process set over the window, ~0 = none */
++    WM_WAYLAND_DEFERRED_HIDE,  /* the pointer button is up: hide the window hidden while it was down */
+ };
+ 
+ enum wayland_surface_config_state
+@@ -338,6 +339,7 @@ struct wayland_surface
+     struct wayland_window_config window;
+     int content_width, content_height;
+     HCURSOR hcursor;
++    BOOL hide_deferred;       /* hidden while a pointer button was down on it: shown transparent until the release */
+     UINT remote_cursor;       /* shape set by another process over a child of it (WM_WAYLAND_REMOTE_CURSOR), 0 = none */
+ };
+ 
+@@ -518,6 +520,8 @@ void wayland_dnd_window_message(HWND hwnd, WPARAM step);
+ void wayland_keyboard_deactivate(HWND hwnd);
+ void wayland_set_remote_cursor(HWND hwnd, UINT shape);
+ HWND wayland_pointer_get_focused_toplevel(void);
++BOOL wayland_pointer_button_down_on(HWND hwnd);
++void wayland_surface_attach_transparent(struct wayland_surface *surface);
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 0b303bf..491447d 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -205,6 +205,23 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
+                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
+ 
++    /* Unreal Engine hides a floating window whose last tab is dragged out, while the button is
++     * down on it: the tab it drags (a subsurface of the window with the pointer) keeps it as
++     * parent, its place relative to it right (where a moved window is on the screen Wine does not
++     * know). It stays mapped, transparent and without input, until the button is up. */
++    if (!visible && (surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
++        (surface->hide_deferred || wayland_pointer_button_down_on(data->hwnd)))
++    {
++        if (!surface->hide_deferred)
++        {
++            TRACE("hwnd=%p hidden when the button is up\n", data->hwnd);
++            surface->hide_deferred = TRUE;
++            wayland_surface_attach_transparent(surface);
++        }
++        return TRUE;
++    }
++    if ((surface = data->wayland_surface)) surface->hide_deferred = FALSE;
++
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+     else if (!data->managed && is_tooltip(data->hwnd, owner_surface)) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+@@ -772,6 +789,24 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_REMOTE_CURSOR:
+         wayland_set_remote_cursor(hwnd, lp);
+         return 0;
++    case WM_WAYLAND_DEFERRED_HIDE:
++    {
++        struct wayland_win_data *data;
++        struct wayland_surface *surface;
++
++        if (!(data = wayland_win_data_get(hwnd))) return 0;
++        if ((surface = data->wayland_surface) && surface->hide_deferred)
++        {
++            surface->hide_deferred = FALSE;
++            if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE))
++            {
++                TRACE("hwnd=%p hidden now\n", hwnd);
++                wayland_surface_clear_role(surface);
++            }
++        }
++        wayland_win_data_release(data);
++        return 0;
++    }
+     case WM_WAYLAND_ALIGN_WINDOW:
+     {
+         struct wayland_win_data *data;

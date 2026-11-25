@@ -1,0 +1,88 @@
+From: Wine Fox
+Subject: [PATCH] winewayland: Menus and drop-down lists as xdg_popups, kept on the screen by the compositor.
+
+Wine does not know where a window is under Wayland, nor where the desktop's panels are: a menu
+or drop-down list Wine kept on the screen was off it by as much as the window is from where Wine
+thinks, and a context menu at the bottom of a window maximized under a top panel lost its last
+items (UnrealGameSync).
+
+Wine's menus, combo boxes' lists, and the drop-downs of WinForms and other programs (topmost
+tool popups, not layered) owned by one of our toplevels are now xdg_popups, as tooltips are:
+the compositor slides them onto the screen, Wine moves the window where it was put, and they
+take input. Unreal Engine's windows are left as they are: it places its menus itself.
+
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index a574e02..0056865 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -176,20 +176,39 @@ static void reapply_cursor_clipping(void)
+  * The common controls' tooltips (UnrealGameSync and other programs), and Unreal Engine's: layered
+  * popups that stay on top and are not in the taskbar, with mouse input (not the decorator of a
+  * tab it drags, which follows the pointer). Not other topmost tool popups (drop-down lists).
+- * Needs xdg_wm_base 3 (xdg_popup.reposition). */
+-static BOOL is_tooltip(HWND hwnd, struct wayland_surface *owner_surface)
++ * Needs xdg_wm_base 3 (xdg_popup.reposition).
++ * Also menus and drop-down lists of other programs (Wine's menus, combo boxes' lists, WinForms'
++ * drop-downs: topmost tool popups, not layered), with input: Wine does not know where
++ * a maximized window is under a panel, and one at the bottom went off the screen. Not Unreal
++ * Engine's windows, which place their menus themselves. *input tells which. */
++static BOOL is_popup(HWND hwnd, struct wayland_surface *owner_surface, BOOL *input)
+ {
+     static const WCHAR tooltipsW[] = {'t','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2',0};
++    static const WCHAR menuW[] = {'#','3','2','7','6','8',0};
++    static const WCHAR unrealW[] = {'U','n','r','e','a','l','W','i','n','d','o','w',0};
++    static const WCHAR combo_listW[] = {'C','o','m','b','o','L','B','o','x',0};
+     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE), ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+     WCHAR buffer[64];
+     UNICODE_STRING name = {.Buffer = buffer, .MaximumLength = sizeof(buffer)};
++    BOOL named = FALSE;
+ 
++    *input = FALSE;
+     if (!owner_surface || !wayland_surface_is_toplevel(owner_surface) || !owner_surface->xdg_surface) return FALSE;
+     if (xdg_wm_base_get_version(process_wayland.xdg_wm_base) < 3) return FALSE;
++    if (NtUserGetClassName(hwnd, FALSE, &name)) named = TRUE;
++    else buffer[0] = 0;
++    /* a combo box's list: a child of the desktop */
++    if (named && !wcsicmp(buffer, combo_listW)) return (*input = TRUE);
+     if ((style & (WS_POPUP | WS_CHILD)) != WS_POPUP) return FALSE;
+-    if (NtUserGetClassName(hwnd, FALSE, &name) && !wcsicmp(buffer, tooltipsW)) return TRUE;
++    if (named && !wcsicmp(buffer, tooltipsW)) return TRUE;
++    if ((ex_style & (WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_APPWINDOW)) ==
++        (WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW))
++        return TRUE;
++    if (named && !wcsicmp(buffer, unrealW)) return FALSE;
++    *input = TRUE;
++    if (named && !wcsicmp(buffer, menuW)) return TRUE;
+     return (ex_style & (WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_APPWINDOW)) ==
+-           (WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
++           (WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
+ }
+ 
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
+@@ -199,6 +218,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     BOOL visible;
+     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+     struct wl_region *input_region;
++    BOOL popup_input = FALSE;
+ 
+     TRACE("hwnd=%p\n", data->hwnd);
+ 
+@@ -224,7 +244,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+     else if (!data->managed && wayland_pointer_drag_wanted(data->hwnd)) role = WAYLAND_SURFACE_ROLE_DND_ICON;
+-    else if (!data->managed && is_tooltip(data->hwnd, owner_surface)) role = WAYLAND_SURFACE_ROLE_POPUP;
++    else if (!data->managed && is_popup(data->hwnd, owner_surface, &popup_input)) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
+@@ -245,7 +265,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+      * Windows behavior. */
+     /* and tooltips: slid in at the edge of the screen one can be under the pointer, and the item
+      * it is the tooltip of losing the pointer hides it (it flickered, at the right edge) */
+-    input_region = (role == WAYLAND_SURFACE_ROLE_POPUP || ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED))) ?
++    input_region = ((role == WAYLAND_SURFACE_ROLE_POPUP && !popup_input) ||
++                    ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED))) ?
+                    wl_compositor_create_region(process_wayland.wl_compositor) :
+                    NULL;
+     wl_surface_set_input_region(surface->wl_surface, input_region);

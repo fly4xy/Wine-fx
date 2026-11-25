@@ -8,7 +8,7 @@ and garbage in the name: Wine read the name first and crashed in vkAllocateMemor
 (Exception 0xc0000005 in Unix call). The name is now looked at only when there is no handle.
 
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
-index f8aedfc..8f4a6aa 100755
+index f8aedfc..8f4a6aa 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
 @@ -963,7 +963,8 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA

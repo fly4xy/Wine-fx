@@ -1,0 +1,116 @@
+From: Wine Fox
+Subject: [PATCH] ntdll: Battle.net's GPU in its own process under Wayland, so its window shows.
+
+Battle.net's window is Chromium's, and Chromium's GPU process, a process of its own, draws in it:
+through Vulkan (DXVK), or with GDI when the GPU is off. winewayland shows nothing a process draws
+in a window of another process: the window stayed empty, only the tray icon and Battle.net's own
+Qt windows (drawn by its process) were there.
+
+Under Wayland (WAYLAND_DISPLAY and no DISPLAY) Battle.net.exe now gets --in-process-gpu on its
+command line, when it has no --type= (Chromium's processes) and no --in-process-gpu of its own:
+Chromium's GPU work, and its drawing in the window, is then in the process of the window, still
+on the GPU. Programs it starts (games) are not changed.
+
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+index 78de98f..bd5f905 100644
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1629,6 +1629,35 @@ static inline void put_unicode_string( WCHAR *src, WCHAR **dst, UNICODE_STRING *
+     copy_unicode_string( &src, dst, str, wcslen(src) * sizeof(WCHAR) );
+ }
+ 
++/* What a process gets added to its command line, NULL for nothing; image is its path
++ * (image_len bytes, not always ended by a 0) and cmdline the command line it was given (len bytes).
++ * Battle.net under Wayland: its window is Chromium's, which Chromium's GPU process (a process of its
++ * own) draws in, through Vulkan (DXVK) or, without the GPU, with GDI; winewayland shows nothing a
++ * process draws in a window of another process, and the window stayed empty. With the GPU in the
++ * browser process, the process of the window draws it, still with the GPU.
++ * Only Battle.net's own process: Chromium gives the others theirs (--type=). */
++static const WCHAR *extra_command_line( const WCHAR *image, UINT image_len, const WCHAR *cmdline, UINT len )
++{
++    static const WCHAR battlenetW[] = {'b','a','t','t','l','e','.','n','e','t','.','e','x','e',0};
++    static const WCHAR typeW[] = {'-','-','t','y','p','e','=',0};
++    static const WCHAR gpuW[] = {'-','-','i','n','-','p','r','o','c','e','s','s','-','g','p','u',0};
++    static const WCHAR extraW[] = {' ','-','-','i','n','-','p','r','o','c','e','s','s','-','g','p','u',0};
++    const WCHAR *name = image, *p;
++    UINT i, n = len / sizeof(WCHAR), name_len;
++
++    /* shortcut: Wayland is taken as the driver when there is no X11 display to use, as Wine
++     * picks it by default; a driver chosen in the registry is not looked at */
++    if (!getenv( "WAYLAND_DISPLAY" ) || getenv( "DISPLAY" )) return NULL;
++    for (p = image; p < image + image_len / sizeof(WCHAR); p++) if (*p == '\\' || *p == '/') name = p + 1;
++    name_len = image + image_len / sizeof(WCHAR) - name;
++    if (name_len != ARRAY_SIZE(battlenetW) - 1 || wcsnicmp( name, battlenetW, name_len )) return NULL;
++    for (i = 0; i + ARRAY_SIZE(typeW) - 1 <= n; i++)
++        if (!wcsnicmp( cmdline + i, typeW, ARRAY_SIZE(typeW) - 1 ) ||
++            !wcsnicmp( cmdline + i, gpuW, ARRAY_SIZE(gpuW) - 1 ))
++            return NULL;
++    return extraW;
++}
++
+ static void copy_dos_path_string( WCHAR **src, WCHAR **dst, UNICODE_STRING *str, UINT len )
+ {
+     if (len > 5 * sizeof(WCHAR) && (*src)[5] == ':') /* skip the \??\ prefix */
+@@ -1933,6 +1962,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params(void)
+     RTL_USER_PROCESS_PARAMETERS *params = NULL;
+     SIZE_T size, env_pos, env_size;
+     WCHAR *dst, *cmdline, *path, *bootstrap;
++    const WCHAR *extra;
+     WCHAR *env = get_initial_environment( &env_pos, &env_size );
+     WCHAR *curdir = get_initial_directory();
+     HANDLE session_key, ifeo_key;
+@@ -2005,6 +2035,14 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params(void)
+ 
+     main_wargv = build_wargv( get_dos_path( nt_name.Buffer ));
+     cmdline = build_command_line( main_wargv );
++    if ((extra = extra_command_line( main_wargv[0], wcslen( main_wargv[0] ) * sizeof(WCHAR), cmdline, wcslen( cmdline ) * sizeof(WCHAR) )))
++    {
++        WCHAR *full = malloc( (wcslen( cmdline ) + wcslen( extra ) + 1) * sizeof(WCHAR) );
++        wcscpy( full, cmdline );
++        wcscat( full, extra );
++        free( cmdline );
++        cmdline = full;
++    }
+ 
+     TRACE( "image %s cmdline %s dir %s\n",
+            debugstr_w(main_wargv[0]), debugstr_w(cmdline), debugstr_w(curdir) );
+@@ -2067,6 +2105,8 @@ void init_startup_info(void)
+     HANDLE session_key, ifeo_key;
+     USHORT machine;
+     BOOL debugged;
++    const WCHAR *cmdline, *extra;
++    UINT extra_len;
+ 
+     if (!startup_info_size)
+     {
+@@ -2110,11 +2150,15 @@ void init_startup_info(void)
+ 
+     virtual_alloc_first_teb();
+ 
++    cmdline = (const WCHAR *)((const char *)(info + 1) + info->imagepath_len + info->curdir_len + info->dllpath_len);
++    extra = extra_command_line( nt_name.Buffer, nt_name.Length, cmdline, info->cmdline_len );
++    extra_len = extra ? wcslen( extra ) * sizeof(WCHAR) : 0;
++
+     size = (sizeof(*params)
+             + info->imagepath_len + sizeof(WCHAR)
+             + MAX_PATH * sizeof(WCHAR)  /* curdir */
+             + info->dllpath_len + sizeof(WCHAR)
+-            + info->cmdline_len + sizeof(WCHAR)
++            + info->cmdline_len + extra_len + sizeof(WCHAR)
+             + info->title_len + sizeof(WCHAR)
+             + info->desktop_len + sizeof(WCHAR)
+             + info->shellinfo_len + sizeof(WCHAR)
+@@ -2158,6 +2202,13 @@ void init_startup_info(void)
+ 
+     if (info->dllpath_len) copy_unicode_string( &src, &dst, &params->DllPath, info->dllpath_len );
+     copy_unicode_string( &src, &dst, &params->CommandLine, info->cmdline_len );
++    if (extra_len)
++    {
++        memcpy( dst - 1, extra, extra_len + sizeof(WCHAR) );
++        dst += extra_len / sizeof(WCHAR);
++        params->CommandLine.Length += extra_len;
++        params->CommandLine.MaximumLength += extra_len;
++    }
+     copy_unicode_string( &src, &dst, &params->WindowTitle, info->title_len );
+     copy_unicode_string( &src, &dst, &params->Desktop, info->desktop_len );
+     copy_unicode_string( &src, &dst, &params->ShellInfo, info->shellinfo_len );

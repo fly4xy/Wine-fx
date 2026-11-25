@@ -55,7 +55,7 @@ dragged out as the last of its window still became a subsurface of that hidden w
 invisible. A window is taken as shown when its surface has these objects.
 
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
-index c564568..dcde2dc 100755
+index ed6deda..8f3ebb6 100644
 --- a/dlls/winewayland.drv/wayland_pointer.c
 +++ b/dlls/winewayland.drv/wayland_pointer.c
 @@ -110,6 +110,18 @@ static const struct
@@ -98,7 +98,7 @@ index c564568..dcde2dc 100755
      wayland_win_data_release(data);
  
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 8ea9d61..7caa23a 100755
+index 8ea9d61..7caa23a 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -488,6 +488,7 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
@@ -110,7 +110,7 @@ index 8ea9d61..7caa23a 100755
                                const struct window_rects *new_rects, struct window_surface *surface);
  BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index 5a769c5..83388a4 100755
+index 5a769c5..83388a4 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -376,6 +376,14 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)

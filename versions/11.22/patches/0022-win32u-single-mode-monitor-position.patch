@@ -1,0 +1,25 @@
+From: Wine Fox
+Subject: [PATCH] win32u: A monitor with a single host mode is where its current mode is.
+
+A display source whose host has one mode only took that mode for its physical one, with no
+position: its monitor was at 0,0, over the primary one, whatever the position of the current
+mode. Wayland compositors, KWin among them, give each output its current mode only, so on a
+second monitor every monitor rect was wrong: windows maximized and menus placed against the
+first monitor, and the work area was cut to nothing.
+
+The physical mode now has the position of the current one.
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index c9cc892..b853b9e 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2226,6 +2226,9 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+     }
+ 
+     physical = modes_count == 1 ? *modes : *current;
++    /* the host's only mode has no position: the monitor is where the current one is */
++    physical.dmFields |= current->dmFields & DM_POSITION;
++    physical.dmPosition = current->dmPosition;
+     if (ctx->is_primary) ctx->primary = *current;
+ 
+     detached.dmPelsWidth = 0;

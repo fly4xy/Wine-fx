@@ -10,12 +10,13 @@ connection of its own to the session bus, so that the tray drops the item when t
 deleted, with the icon's pixels, its tip as title and tooltip, and NIS_HIDDEN as Passive.
 Activate, ContextMenu and SecondaryActivate reach the icon's window as the clicks of explorer's
 own tray window do (with NIN_SELECT and WM_CONTEXTMENU for NOTIFYICON_VERSION and later);
-Activate is followed by a double click, since most Windows programs open on one. A Wine thread
+Activate is followed by a double click, since most Windows programs open on one; the cursor is put
+where the tray was clicked, where programs open their menu. A Wine thread
 of explorer serves the connections. libdbus is loaded at run time; without it or without a
 watcher, NotifyIcon returns -1 and explorer shows the icon itself as before.
 
 diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
-index afe7902..e6df653 100755
+index afe7902..e6df653 100644
 --- a/dlls/winewayland.drv/Makefile.in
 +++ b/dlls/winewayland.drv/Makefile.in
 @@ -1,6 +1,6 @@
@@ -35,7 +36,7 @@ index afe7902..e6df653 100755
  	text-input-unstable-v3.xml \
  	viewporter.xml \
 diff --git a/dlls/winewayland.drv/dllmain.c b/dlls/winewayland.drv/dllmain.c
-index 8055d88..4c5583f 100755
+index 8055d88..4c5583f 100644
 --- a/dlls/winewayland.drv/dllmain.c
 +++ b/dlls/winewayland.drv/dllmain.c
 @@ -38,6 +38,12 @@ static DWORD WINAPI wayland_read_events_thread(void *arg)
@@ -63,10 +64,10 @@ index 8055d88..4c5583f 100755
  }
 diff --git a/dlls/winewayland.drv/systray.c b/dlls/winewayland.drv/systray.c
 new file mode 100755
-index 0000000..0d331a5
+index 0000000..e021895
 --- /dev/null
 +++ b/dlls/winewayland.drv/systray.c
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,642 @@
 +/*
 + * Wayland driver system tray: StatusNotifierItem over D-Bus
 + *
@@ -379,9 +380,16 @@ index 0000000..0d331a5
 +    NtUserMessageCall(icon->owner, icon->callback_message, wp, lp, 0, NtUserSendNotifyMessage, FALSE);
 +}
 +
-+static void notify_click(struct tray_icon *icon, UINT down, BOOL dblclk)
++static void notify_click(struct tray_icon *icon, DBusMessage *msg, UINT down, BOOL dblclk)
 +{
 +    UINT up = down + 1;
++    dbus_int32_t x, y;
++
++    /* where the tray was clicked: Wine does not know where the pointer is out of its windows, and
++     * programs open their menu at the cursor (it was at 0,0, under a top panel) */
++    if (p_dbus_message_get_args(msg, NULL, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INVALID) &&
++        (x || y))
++        NtUserSetCursorPos(x, y);
 +
 +    notify_owner(icon, down);
 +    notify_owner(icon, up);
@@ -408,11 +416,11 @@ index 0000000..0d331a5
 +    unsigned int i;
 +
 +    if (p_dbus_message_is_method_call(msg, ITEM_IFACE, "Activate"))
-+        notify_click(icon, WM_LBUTTONDOWN, TRUE);
++        notify_click(icon, msg, WM_LBUTTONDOWN, TRUE);
 +    else if (p_dbus_message_is_method_call(msg, ITEM_IFACE, "ContextMenu"))
-+        notify_click(icon, WM_RBUTTONDOWN, FALSE);
++        notify_click(icon, msg, WM_RBUTTONDOWN, FALSE);
 +    else if (p_dbus_message_is_method_call(msg, ITEM_IFACE, "SecondaryActivate"))
-+        notify_click(icon, WM_MBUTTONDOWN, FALSE);
++        notify_click(icon, msg, WM_MBUTTONDOWN, FALSE);
 +    else if (p_dbus_message_is_method_call(msg, ITEM_IFACE, "Scroll"))
 +        ;
 +    else if (p_dbus_message_is_method_call(msg, "org.freedesktop.DBus.Introspectable", "Introspect"))
@@ -703,7 +711,7 @@ index 0000000..0d331a5
 +
 +#endif /* SONAME_LIBDBUS_1 */
 diff --git a/dlls/winewayland.drv/unixlib.h b/dlls/winewayland.drv/unixlib.h
-index d9378fe..b6927fb 100755
+index d9378fe..b6927fb 100644
 --- a/dlls/winewayland.drv/unixlib.h
 +++ b/dlls/winewayland.drv/unixlib.h
 @@ -28,6 +28,8 @@ enum waylanddrv_unix_func
@@ -716,7 +724,7 @@ index d9378fe..b6927fb 100755
  };
  
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 4d5206e..1a9693b 100755
+index 4d5206e..1a9693b 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -497,6 +497,10 @@ void wayland_keyboard_deactivate(HWND hwnd);
@@ -731,7 +739,7 @@ index 4d5206e..1a9693b 100755
  struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format, BOOL raw);
  BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
 diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
-index 59680b8..28355bb 100755
+index 59680b8..28355bb 100644
 --- a/dlls/winewayland.drv/waylanddrv_main.c
 +++ b/dlls/winewayland.drv/waylanddrv_main.c
 @@ -39,12 +39,14 @@ static const struct user_driver_funcs waylanddrv_funcs =

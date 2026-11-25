@@ -17,7 +17,7 @@ gets what the frame stands for around it; a configure without a size keeps the w
 xdg-decoration-unstable-v1.xml is the one of wayland-protocols (MIT).
 
 diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
-index 411d045..afe7902 100755
+index 411d045..afe7902 100644
 --- a/dlls/winewayland.drv/Makefile.in
 +++ b/dlls/winewayland.drv/Makefile.in
 @@ -31,6 +31,7 @@ SOURCES = \
@@ -29,7 +29,7 @@ index 411d045..afe7902 100755
  	xdg-shell.xml \
  	xdg-toplevel-icon-v1.xml
 diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
-index 118ee2d..9310a16 100755
+index 118ee2d..9310a16 100644
 --- a/dlls/winewayland.drv/wayland.c
 +++ b/dlls/winewayland.drv/wayland.c
 @@ -189,6 +189,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
@@ -45,7 +45,7 @@ index 118ee2d..9310a16 100755
      {
          process_wayland.xdg_toplevel_icon_manager_v1 =
 diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
-index a1b1587..f94a5af 100755
+index a1b1587..f94a5af 100644
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
 @@ -436,6 +436,13 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
@@ -76,7 +76,7 @@ index a1b1587..f94a5af 100755
              surface->xdg_toplevel = NULL;
          }
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 7caa23a..4d5206e 100755
+index 7caa23a..4d5206e 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -34,6 +34,7 @@
@@ -114,7 +114,7 @@ index 7caa23a..4d5206e 100755
  LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
  void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
-index 60b8017..59680b8 100755
+index 60b8017..59680b8 100644
 --- a/dlls/winewayland.drv/waylanddrv_main.c
 +++ b/dlls/winewayland.drv/waylanddrv_main.c
 @@ -41,6 +41,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
@@ -126,7 +126,7 @@ index 60b8017..59680b8 100755
      .pSetIMECompositionRect = WAYLAND_SetIMECompositionRect,
      .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index 83388a4..bac1c88 100755
+index 83388a4..bac1c88 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -290,6 +290,24 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac

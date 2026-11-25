@@ -1,0 +1,26 @@
+From: Wine Fox
+Subject: [PATCH] win32u: Windows with a caption are never clipped as fullscreen.
+
+Wine clips the cursor to a foreground window that covers its monitor, for fullscreen games.
+Only maximized windows with a caption were left out: Unreal Editor's window made as big as the
+monitor without being maximized kept the pointer inside it (under Wayland a confined pointer, so
+the desktop's panels could not be reached). Windows itself never clips; a window with a caption is
+an application's window, not a fullscreen game, whatever its size.
+
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index 40f076a..ab219be 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2817,8 +2817,10 @@ BOOL clip_fullscreen_window( HWND hwnd, BOOL reset )
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     if (!(style & WS_VISIBLE)) return FALSE;
+     if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) return FALSE;
+-    /* maximized windows don't count as full screen */
+-    if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION) return FALSE;
++    /* windows with a caption don't count as full screen, maximized or not: an application's
++     * window the user made as big as the monitor (Unreal Editor) is no fullscreen game, and
++     * clipping the cursor to it keeps the pointer from ever leaving it (the desktop's panels) */
++    if ((style & WS_CAPTION) == WS_CAPTION) return FALSE;
+ 
+     ctx = set_thread_dpi_awareness_context( NTUSER_DPI_PER_MONITOR_AWARE );
+     if (!(ret = get_present_rect( hwnd, &window_rect, get_thread_dpi() )))

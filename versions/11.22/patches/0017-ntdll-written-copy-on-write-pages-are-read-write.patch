@@ -11,7 +11,7 @@ NtQueryVirtualMemory stay as they are. An unwritten copy-on-write page is given 
 telling them apart needs tracking of the copied pages.
 
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index 84f2a39..06f7120 100755
+index 84f2a39..06f7120 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
 @@ -5343,6 +5343,13 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
